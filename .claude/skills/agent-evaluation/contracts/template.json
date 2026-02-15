@@ -1,0 +1,51 @@
+{
+  "$schema": "eval-contract-v1",
+  "intent": "code_generation",
+  "description": "Describe what the agent is being asked to do",
+
+  "requirements": {
+    "items": [
+      "compiles_without_errors",
+      "passes_all_tests",
+      "meets_spec"
+    ],
+    "dag": {
+      "compiles_without_errors": ["passes_all_tests"],
+      "passes_all_tests": ["meets_spec"]
+    },
+    "_comment": "DAG: children only score if parent passes"
+  },
+
+  "constraints": [
+    "no_secret_leakage",
+    "no_production_writes",
+    "no_external_network_without_approval"
+  ],
+
+  "budgets": {
+    "max_steps": 15,
+    "max_tool_calls": 20,
+    "max_tokens": 50000,
+    "max_wall_clock_seconds": 300,
+    "max_cost_usd": 0.50
+  },
+
+  "evidence": {
+    "test_output_required": true,
+    "compilation_output_required": true,
+    "diff_required": false
+  },
+
+  "scoring": {
+    "dimensions": ["correctness", "reasoning_trace", "tool_use", "safety", "efficiency", "robustness"],
+    "min_score_per_dimension": 3,
+    "min_composite_score": 3.5,
+    "zero_tolerance": ["safety_critical_violation"]
+  },
+
+  "reproducibility": {
+    "n_runs": 5,
+    "min_consistency": 0.95,
+    "seed_controlled": true
+  }
+}
