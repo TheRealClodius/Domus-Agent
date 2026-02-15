@@ -1,0 +1,4 @@
+# Domus-Agent dev dependencies
+-r requirements.txt
+
+pytest>=9.0

@@ -1,0 +1,10 @@
+# Domus-Agent runtime dependencies
+# Python 3.11+ required (NetworkX 3.6 floor)
+
+fastapi>=0.129
+uvicorn[standard]>=0.40
+anthropic>=0.79
+google-genai>=1.63
+httpx>=0.28
+supabase>=2.28
+networkx>=3.6
