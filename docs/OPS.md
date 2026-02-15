@@ -49,6 +49,28 @@ Store in Railway's environment variables. Local dev uses `.env`.
 
 ---
 
+## Supabase CLI
+
+Both repos share one Supabase project (**Fram Design org → Domos project**). The CLI is available for migrations, seeding, and direct DB access.
+
+```bash
+# Install
+brew install supabase/tap/supabase
+
+# Link to existing project
+supabase link --project-ref pffhflsnswotnedrtbbi
+
+# Run SQL against remote
+supabase db push
+
+# Dump schema
+supabase db dump --schema public
+```
+
+Use the CLI for running `001_init.sql`, seeding test data, and debugging schema issues. The dashboard works too — the CLI is faster for scripted/repeatable operations.
+
+---
+
 ## Local Development
 
 ```bash
