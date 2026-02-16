@@ -179,11 +179,12 @@ Without compaction, conversations fill the context window and eventually break. 
 5. Parse Opus response into three outputs:
    - **Summary text** → create a `conversation_summary` entity (`presentation='hidden'`, `state: { summary, turn_count, first_turn_at, last_turn_at }`)
    - **Facts** → create `fact` entities (`presentation='hidden'`, `state: { content, confidence, source_turn_ids }`)
+     - Deduplicate facts within the space before insert/update. If a semantically equivalent fact already exists, update its confidence/source_turn_ids instead of creating a duplicate row.
    - **Edges** → create `edge` entities (`presentation='hidden'`, `state: { source_id, target_id, relation, weight }`)
 6. Archive the compacted turns (`update_entity(id, archived=True)`)
 7. Return `{ summary_id, fact_count, edge_count, turns_archived }`
 
-Test: mock Anthropic (Opus call) to return a structured compaction response. Create 45 conversation turns, run compaction, verify: summary entity created, fact entities created, old turns archived, recent 5 preserved.
+Test: mock Anthropic (Opus call) to return a structured compaction response. Create 45 conversation turns, run compaction, verify: summary entity created, fact entities created, duplicate facts merged (not duplicated), old turns archived, recent 5 preserved.
 
 ### 6.2 — Wire compaction into context
 
