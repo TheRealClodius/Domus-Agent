@@ -95,12 +95,14 @@ async def agent_endpoint(req: AgentRequest):
                 on_event=on_event,
             )
         )
+        terminal_event_sent = False
         try:
             while True:
                 try:
                     event = await asyncio.wait_for(queue.get(), timeout=0.1)
                     yield format_sse_event(event)
                     if event.get("type") in ("done", "error"):
+                        terminal_event_sent = True
                         break
                 except asyncio.TimeoutError:
                     if task.done():
@@ -108,6 +110,17 @@ async def agent_endpoint(req: AgentRequest):
                         while not queue.empty():
                             event = queue.get_nowait()
                             yield format_sse_event(event)
+                            if event.get("type") in ("done", "error"):
+                                terminal_event_sent = True
+
+                        if not terminal_event_sent:
+                            exc = task.exception()
+                            if exc is not None:
+                                yield format_sse_event(
+                                    {"type": "error", "message": str(exc)}
+                                )
+                            else:
+                                yield format_sse_event({"type": "done"})
                         break
         finally:
             if not task.done():
