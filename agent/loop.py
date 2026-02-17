@@ -130,7 +130,7 @@ async def run_agent(
 
     logger.info(
         "agent_turn_start",
-        extra={"space_id": space_id, "user_id": user_id},
+        extra={"space_id": space_id, "user_id": user_id, "user_timezone": user_timezone},
     )
 
     # Build system prompt

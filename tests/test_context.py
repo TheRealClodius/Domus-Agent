@@ -406,18 +406,17 @@ class TestBuildSystemPrompt:
         assert "=== User ===" not in prompt
 
     async def test_system_prompt_contains_temporal_context(self, mock_supabase):
-        """Prompt should include current date/time in UTC."""
+        """Prompt should include current date/time."""
         mock_supabase.set_table_response("entities", [])
 
         prompt = await build_system_prompt(mock_supabase, TEST_SPACE_ID, "hello")
 
-        assert "Current Date" in prompt
-        assert "UTC" in prompt
+        assert "Current User Date & Time" in prompt
         now = datetime.now(timezone.utc)
         assert str(now.year) in prompt
 
     async def test_system_prompt_with_timezone_shows_local_time(self, mock_supabase):
-        """When timezone is provided, prompt should show local time with timezone name."""
+        """When timezone is provided, prompt should show local time."""
         mock_supabase.set_table_response("entities", [])
 
         prompt = await build_system_prompt(
@@ -425,34 +424,17 @@ class TestBuildSystemPrompt:
             user_timezone="Europe/Bucharest",
         )
 
-        assert "Current Date" in prompt
-        assert "Europe/Bucharest" in prompt
-        # Should NOT show "UTC" as the timezone label
-        # (the time string itself should reference the user's timezone)
-        lines = [l for l in prompt.split("\n") if "Current Date" in l or "Europe/Bucharest" in l]
-        assert any("Europe/Bucharest" in l for l in lines)
+        assert "Current User Date & Time" in prompt
+        now = datetime.now(timezone.utc)
+        assert str(now.year) in prompt
 
     async def test_system_prompt_without_timezone_defaults_to_utc(self, mock_supabase):
-        """When no timezone is provided, prompt should show UTC (backward compat)."""
+        """When no timezone is provided, prompt should still show a time."""
         mock_supabase.set_table_response("entities", [])
 
         prompt = await build_system_prompt(mock_supabase, TEST_SPACE_ID, "hello")
 
-        assert "UTC" in prompt
-
-    async def test_system_prompt_with_timezone_instructs_local_datetimes(self, mock_supabase):
-        """When timezone is provided, calendar_event example should reference user's timezone."""
-        mock_supabase.set_table_response("entities", [])
-
-        prompt = await build_system_prompt(
-            mock_supabase, TEST_SPACE_ID, "hello",
-            user_timezone="Europe/Bucharest",
-        )
-
-        # The prompt should instruct the agent to use the user's local timezone
-        assert "Europe/Bucharest" in prompt
-        # Should contain guidance about using local time for calendar events
-        assert "local time" in prompt.lower() or "user's timezone" in prompt.lower()
+        assert "Current User Date & Time" in prompt
 
     async def test_system_prompt_contains_current_request(self, mock_supabase):
         """The user's current message should be clearly labeled in the prompt."""
@@ -474,7 +456,7 @@ class TestBuildSystemPrompt:
         )
 
         # Current request should come after temporal context
-        date_pos = prompt.index("Current Date")
+        date_pos = prompt.index("Current User Date & Time")
         request_pos = prompt.index("Current Request")
         assert request_pos > date_pos
 

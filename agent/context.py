@@ -124,7 +124,7 @@ calendar_event:
   A single calendar event. Always use presentation='hidden' — the calendar app reads these automatically.
   state: { title: string, start: ISO datetime, end: ISO datetime, all_day: boolean, color?: 'default' | 'warm' | 'cool' | 'muted' }
   presentation: 'hidden'
-  Example: create_entity(type='calendar_event', presentation='hidden', state={ title: 'Team standup', start: '2026-02-17T15:00:00Z', end: '2026-02-17T15:30:00Z', all_day: false }, summary='Team standup at 3pm')
+  Example: create_entity(type='calendar_event', presentation='hidden', state={ title: 'Team standup', start: '2026-02-17T15:00:00', end: '2026-02-17T15:30:00', all_day: false }, summary='Team standup at 3pm')
 
 === Singleton Apps (do NOT create duplicates) ===
 chat, settings, sounds — these are built-in apps limited to one instance per space. Only update existing ones if the user asks.
@@ -184,7 +184,7 @@ async def build_system_prompt(
                 f"- [{e['type']}] {e['id']}: {summary} ({e['presentation']})"
             )
         parts.append(
-            "## Current entities in this space:\n" + "\n".join(entity_lines)
+            "## Current entities in this space (source of truth — if something isn't listed here, it was deleted):\n" + "\n".join(entity_lines)
         )
     else:
         parts.append("## Current entities in this space:\nNo entities yet.")
@@ -240,25 +240,17 @@ async def build_system_prompt(
             turn_lines.append(f"{role}: {content}")
         parts.append("## Recent conversation:\n" + "\n".join(turn_lines))
 
-    # Temporal context
+    # Temporal context — show the user's local time, fall back to UTC
     now_utc = datetime.now(timezone.utc)
     if user_timezone:
         try:
-            tz = ZoneInfo(user_timezone)
-            local_now = now_utc.astimezone(tz)
-            time_str = local_now.strftime(f"%A, %d %B %Y, %H:%M ({user_timezone})")
-            parts.append(f"=== Current Date & Time ===\n{time_str}")
-            parts.append(
-                f"=== User Timezone ===\n"
-                f"The user is in {user_timezone}. "
-                f"When creating calendar events, use the user's local time for start/end datetimes."
-            )
+            local_now = now_utc.astimezone(ZoneInfo(user_timezone))
         except KeyError:
-            time_str = now_utc.strftime("%A, %d %B %Y, %H:%M UTC")
-            parts.append(f"=== Current Date & Time ===\n{time_str}")
+            local_now = now_utc
     else:
-        time_str = now_utc.strftime("%A, %d %B %Y, %H:%M UTC")
-        parts.append(f"=== Current Date & Time ===\n{time_str}")
+        local_now = now_utc
+    time_str = local_now.strftime("%H:%M %d %b %Y")
+    parts.append(f"=== Current User Date & Time ===\n{time_str}")
 
     # Current user request — clearly marked so the agent knows what to respond to
     parts.append(f"=== Current Request ===\n{message}")
