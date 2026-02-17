@@ -201,7 +201,7 @@ async def create_entity(client, space_id: str, user_id: str, params: dict) -> di
                 "image_generation_failed",
                 extra={"space_id": space_id, "error": str(e)},
             )
-            state["generation_error"] = str(e)
+            state["generation_error"] = str(e)[:200]
 
     # Image-specific defaults
     if entity_type == "image":
