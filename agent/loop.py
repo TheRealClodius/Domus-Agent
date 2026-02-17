@@ -107,7 +107,6 @@ async def run_agent(
     visible_entity_ids: list[str] | None = None,
     context_items: list[dict] | None = None,
     user_timezone: str | None = None,
-    calendar_events: list[dict] | None = None,
 ):
     """Run the agent loop. Calls Claude, handles tool calls, streams events.
 
@@ -123,7 +122,6 @@ async def run_agent(
         visible_entity_ids: Entity IDs currently visible on canvas
         context_items: File attachments [{id, name, type, data}] with base64 data URLs
         user_timezone: IANA timezone string (e.g. 'Europe/Bucharest')
-        calendar_events: Upcoming Google Calendar events from frontend
     """
     if on_event is None:
 
@@ -143,7 +141,6 @@ async def run_agent(
         visible_entity_ids=visible_entity_ids,
         user_id=user_id,
         user_timezone=user_timezone,
-        calendar_events=calendar_events,
     )
 
     # Save user turn (text only — don't persist base64 attachments)
