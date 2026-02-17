@@ -223,7 +223,7 @@ async def create_entity(client, space_id: str, user_id: str, params: dict) -> di
         "summary": params.get("summary"),
         "created_by": "agent",
     }
-    result = await client.table("entities").insert(row).select("*").execute()
+    result = await client.table("entities").insert(row).execute()
     return result.data[0] if result.data else row
 
 
@@ -314,7 +314,6 @@ async def update_entity(client, space_id: str, user_id: str, params: dict) -> di
         .update(updates)
         .eq("id", entity_id)
         .eq("space_id", space_id)
-        .select("*")
         .execute()
     )
     if isinstance(result.data, list) and result.data:

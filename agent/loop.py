@@ -76,7 +76,7 @@ async def save_conversation_turn(
         "state": {"role": role, "content": content},
         "created_by": "agent",
     }
-    result = await client.table("entities").insert(row).select("*").execute()
+    result = await client.table("entities").insert(row).execute()
     return result.data[0] if result.data else row
 
 

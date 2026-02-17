@@ -157,16 +157,22 @@ async def build_system_prompt(
     """
     parts = [_BASE_INSTRUCTIONS.strip()]
 
-    # Space name
-    space_info = await get_space_info(client, space_id)
-    if space_info and space_info.get("name"):
-        parts.append(f"=== Space: {space_info['name']} ===")
+    # Space name (non-critical — degrade gracefully if table missing)
+    try:
+        space_info = await get_space_info(client, space_id)
+        if space_info and space_info.get("name"):
+            parts.append(f"=== Space: {space_info['name']} ===")
+    except Exception:
+        pass
 
-    # User profile
+    # User profile (non-critical — degrade gracefully if table missing)
     if user_id:
-        profile = await get_user_profile(client, user_id)
-        if profile and profile.get("name"):
-            parts.append(f"=== User ===\nThe user's name is {profile['name']}.")
+        try:
+            profile = await get_user_profile(client, user_id)
+            if profile and profile.get("name"):
+                parts.append(f"=== User ===\nThe user's name is {profile['name']}.")
+        except Exception:
+            pass
 
     # Entity index
     entities = await get_entity_index(client, space_id)
@@ -190,7 +196,10 @@ async def build_system_prompt(
             f"Viewport: {viewport.get('width', '?')}\u00d7{viewport.get('height', '?')}"
         )
     if focused_entity_id:
-        focused_full = await get_focused_entity(client, space_id, focused_entity_id)
+        try:
+            focused_full = await get_focused_entity(client, space_id, focused_entity_id)
+        except Exception:
+            focused_full = None
         if focused_full:
             canvas_lines.append(
                 f"Focused: [{focused_full.get('type', '?')}] {focused_full['id']}: "
