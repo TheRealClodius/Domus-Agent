@@ -19,11 +19,11 @@ class MockStorageBucket:
     def __init__(self):
         self.uploaded = {}  # path -> bytes
 
-    def upload(self, path: str, data: bytes, file_options=None):
+    async def upload(self, path: str, data: bytes, file_options=None):
         self.uploaded[path] = data
         return MagicMock()  # upload response
 
-    def get_public_url(self, path: str) -> str:
+    async def get_public_url(self, path: str) -> str:
         return f"https://test.supabase.co/storage/v1/object/public/images/{path}"
 
 

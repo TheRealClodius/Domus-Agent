@@ -66,14 +66,14 @@ async def generate_image(
     filename = f"{uuid.uuid4()}.png"
     storage_path = f"{space_id}/{filename}"
     bucket = supabase_client.storage.from_("images")
-    bucket.upload(
+    await bucket.upload(
         storage_path,
         png_bytes,
         file_options={"content-type": "image/png"},
     )
 
     # 5. Get public URL
-    public_url = bucket.get_public_url(storage_path)
+    public_url = await bucket.get_public_url(storage_path)
 
     logger.info(
         "image_generated",
