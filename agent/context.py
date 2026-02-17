@@ -122,9 +122,10 @@ calendar:
 
 calendar_event:
   A single calendar event. Always use presentation='hidden' — the calendar app reads these automatically.
-  state: { title: string, start: ISO datetime, end: ISO datetime, all_day: boolean, color?: 'default' | 'warm' | 'cool' | 'muted' }
+  state: { title: string, start: ISO datetime, end: ISO datetime, all_day: boolean, color?: 'default' | 'warm' | 'cool' | 'muted', attendees?: string[] }
+  attendees is an optional list of attendee names (e.g. ['Alice', 'Bob']). Include when the user mentions who's attending.
   presentation: 'hidden'
-  Example: create_entity(type='calendar_event', presentation='hidden', state={ title: 'Team standup', start: '2026-02-17T15:00:00', end: '2026-02-17T15:30:00', all_day: false }, summary='Team standup at 3pm')
+  Example: create_entity(type='calendar_event', presentation='hidden', state={ title: 'Team standup', start: '2026-02-17T15:00:00', end: '2026-02-17T15:30:00', all_day: false, attendees: ['Alice', 'Bob'] }, summary='Team standup at 3pm')
 
 === Singleton Apps (do NOT create duplicates) ===
 chat, settings, sounds — these are built-in apps limited to one instance per space. Only update existing ones if the user asks.
@@ -137,6 +138,40 @@ hidden: Not rendered on canvas (use for calendar_event, conversation_turn, facts
 """
 
 
+def _format_calendar_events(events: list[dict]) -> str:
+    """Format Google Calendar events for the system prompt."""
+    lines = []
+    for e in events:
+        title = e.get("title", "(no title)")
+        start = e.get("start", "?")
+        end = e.get("end", "")
+
+        if e.get("all_day"):
+            time_str = f"{start} (all day)"
+        else:
+            time_str = f"{start} → {end}" if end else start
+
+        parts = [f"- {title}: {time_str}"]
+
+        attendees = e.get("attendees")
+        if attendees:
+            names = []
+            for a in attendees:
+                if isinstance(a, str):
+                    names.append(a)
+                else:
+                    display = a.get("displayName") or a.get("email", "?")
+                    email = a.get("email", "")
+                    if a.get("displayName") and email:
+                        names.append(f"{display} ({email})")
+                    else:
+                        names.append(display)
+            parts.append(f"  Attendees: {', '.join(names)}")
+
+        lines.append("\n".join(parts))
+    return "\n".join(lines)
+
+
 async def build_system_prompt(
     client, space_id: str, message: str,
     viewport: dict | None = None,
@@ -144,6 +179,7 @@ async def build_system_prompt(
     visible_entity_ids: list[str] | None = None,
     user_id: str | None = None,
     user_timezone: str | None = None,
+    calendar_events: list[dict] | None = None,
 ) -> str:
     """Assemble the system prompt for a given space and message.
 
@@ -239,6 +275,17 @@ async def build_system_prompt(
             content = state.get("content", "")
             turn_lines.append(f"{role}: {content}")
         parts.append("## Recent conversation:\n" + "\n".join(turn_lines))
+
+    # Google Calendar events (read-only awareness from frontend)
+    if calendar_events:
+        formatted = _format_calendar_events(calendar_events)
+        parts.append(
+            "=== Google Calendar Events ===\n"
+            "These are upcoming events from the user's connected Google Calendar.\n"
+            "You can create new calendar_event entities — they automatically sync to Google Calendar.\n"
+            "You cannot edit or delete existing Google Calendar events directly.\n"
+            + formatted
+        )
 
     # Temporal context — show the user's local time, fall back to UTC
     now_utc = datetime.now(timezone.utc)

@@ -76,6 +76,7 @@ class AgentRequest(BaseModel):
     visible_entity_ids: list[str] | None = None
     context_items: list[dict] | None = None
     user_timezone: str | None = None
+    calendar_events: list[dict] | None = None
 
 
 @app.post("/agent", dependencies=[Depends(verify_service_auth)])
@@ -103,6 +104,7 @@ async def agent_endpoint(req: AgentRequest):
                 visible_entity_ids=req.visible_entity_ids,
                 context_items=req.context_items,
                 user_timezone=req.user_timezone,
+                calendar_events=req.calendar_events,
             )
         )
         terminal_event_sent = False

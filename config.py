@@ -38,4 +38,4 @@ def create_anthropic_client():
     """Create an Anthropic AsyncAnthropic client."""
     from anthropic import AsyncAnthropic
 
-    return AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+    return AsyncAnthropic(api_key=ANTHROPIC_API_KEY, max_retries=5)

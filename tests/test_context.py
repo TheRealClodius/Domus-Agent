@@ -268,6 +268,14 @@ class TestBuildSystemPrompt:
         assert "calendar_event:" in prompt
         assert "hidden" in prompt
 
+    async def test_system_prompt_calendar_event_has_attendees(self, mock_supabase):
+        """calendar_event state shape should include attendees field."""
+        mock_supabase.set_table_response("entities", [])
+
+        prompt = await build_system_prompt(mock_supabase, TEST_SPACE_ID, "hello")
+
+        assert "attendees" in prompt
+
     async def test_system_prompt_singleton_awareness(self, mock_supabase):
         """Prompt should warn about singleton apps (chat, settings, sounds)."""
         mock_supabase.set_table_response("entities", [])
@@ -459,6 +467,105 @@ class TestBuildSystemPrompt:
         date_pos = prompt.index("Current User Date & Time")
         request_pos = prompt.index("Current Request")
         assert request_pos > date_pos
+
+    async def test_system_prompt_includes_calendar_events(self, mock_supabase):
+        """When calendar_events are provided, they appear in the prompt."""
+        mock_supabase.set_table_response("entities", [])
+
+        events = [
+            {"title": "Dinner with Andreia", "start": "2026-02-17T19:00:00", "end": "2026-02-17T21:00:00"},
+            {"title": "Team standup", "start": "2026-02-18T10:00:00", "end": "2026-02-18T10:30:00"},
+        ]
+
+        prompt = await build_system_prompt(
+            mock_supabase, TEST_SPACE_ID, "what's on my calendar?",
+            calendar_events=events,
+        )
+
+        assert "Dinner with Andreia" in prompt
+        assert "Team standup" in prompt
+        assert "Google Calendar Events" in prompt
+
+    async def test_system_prompt_omits_calendar_section_when_none(self, mock_supabase):
+        """When no calendar_events are provided, no calendar section appears."""
+        mock_supabase.set_table_response("entities", [])
+
+        prompt = await build_system_prompt(mock_supabase, TEST_SPACE_ID, "hello")
+
+        assert "Google Calendar Events" not in prompt
+
+    async def test_system_prompt_omits_calendar_section_when_empty(self, mock_supabase):
+        """When calendar_events is an empty list, no calendar section appears."""
+        mock_supabase.set_table_response("entities", [])
+
+        prompt = await build_system_prompt(
+            mock_supabase, TEST_SPACE_ID, "hello",
+            calendar_events=[],
+        )
+
+        assert "Google Calendar Events" not in prompt
+
+    async def test_calendar_events_show_attendees(self, mock_supabase):
+        """Calendar events with attendees should show them."""
+        mock_supabase.set_table_response("entities", [])
+
+        events = [
+            {
+                "title": "Dinner",
+                "start": "2026-02-17T19:00:00",
+                "end": "2026-02-17T21:00:00",
+                "attendees": [
+                    {"email": "alice@example.com", "displayName": "Alice"},
+                    {"email": "bob@example.com"},
+                ],
+            },
+        ]
+
+        prompt = await build_system_prompt(
+            mock_supabase, TEST_SPACE_ID, "who's at dinner?",
+            calendar_events=events,
+        )
+
+        assert "Alice" in prompt
+        assert "alice@example.com" in prompt
+        assert "bob@example.com" in prompt
+
+    async def test_calendar_events_handle_string_attendees(self, mock_supabase):
+        """Attendees as plain strings (not dicts) should not crash."""
+        mock_supabase.set_table_response("entities", [])
+
+        events = [
+            {
+                "title": "Dinner",
+                "start": "2026-02-17T19:00:00",
+                "end": "2026-02-17T21:00:00",
+                "attendees": ["Alice", "bob@example.com"],
+            },
+        ]
+
+        prompt = await build_system_prompt(
+            mock_supabase, TEST_SPACE_ID, "who's coming?",
+            calendar_events=events,
+        )
+
+        assert "Alice" in prompt
+        assert "bob@example.com" in prompt
+
+    async def test_calendar_events_show_all_day(self, mock_supabase):
+        """All-day events should be labeled as such."""
+        mock_supabase.set_table_response("entities", [])
+
+        events = [
+            {"title": "Holiday", "start": "2026-02-17", "end": "2026-02-18", "all_day": True},
+        ]
+
+        prompt = await build_system_prompt(
+            mock_supabase, TEST_SPACE_ID, "anything today?",
+            calendar_events=events,
+        )
+
+        assert "Holiday" in prompt
+        assert "all day" in prompt.lower() or "all-day" in prompt.lower()
 
     async def test_system_prompt_contains_space_name(self, mock_supabase):
         """When space has a name, prompt includes it."""
