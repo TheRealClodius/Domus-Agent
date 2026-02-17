@@ -1,14 +1,14 @@
-# Domus Agent
+# Domus-Agent
 
-The standalone Python agent service for Domus — an agent-first spatial OS. This repo is the agent core, not the app. The frontend lives in `domus-web/`.
+The standalone Python agent service for Domus — an agent-first spatial OS. 
+This repo is the agent core, not the app. When developing locally, the frontend lives in `/Users/andreiclodius/Documents/Projects/Domus/...`. You can to to .../Domus/Docs/ARCHITECTURE.md to have a unified view of the product and in .../Domus/OPS.md to see how services connect. When developing remotely you won't be able to access the Domus repo. 
 
+In this repo you also have a docs/AGENT-INTERNALS.MD and a docs/OPS.md with domus-agent specific info.
+ 
 ## System Context
 
 Domus is three things: a Next.js frontend on Vercel, this agent service on Railway, and Supabase (Postgres, Auth, Realtime, Storage). The agent is the brain — it takes user messages, calls Claude (Sonnet for turns, Opus for compaction), and manipulates entities in Supabase via 5 tools. The frontend streams agent responses via SSE through a Vercel proxy.
 
-**System docs** (read-only, not in this repo): `/Users/andreiclodius/Documents/Projects/Domus/docs/`
-- `ARCHITECTURE.md` — Founding doc. Entity model, DB schema, agent design, app contract, build order
-- `DESIGN-DIRECTION.md` — Visual language, design tokens, component patterns
 
 ## Quick Reference
 
