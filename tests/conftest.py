@@ -111,11 +111,15 @@ class MockQueryBuilder:
         return self
 
     def maybe_single(self, *args, **kwargs):
+        self._maybe_single = True
         return self
 
     async def execute(self):
         result = MagicMock()
-        result.data = self._data
+        if getattr(self, "_maybe_single", False) and isinstance(self._data, list):
+            result.data = self._data[0] if self._data else None
+        else:
+            result.data = self._data
         result.count = self._count
         return result
 

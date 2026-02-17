@@ -31,7 +31,7 @@ TOOL_DEFINITIONS = [
                 },
                 "presentation": {
                     "type": "string",
-                    "enum": ["window", "card", "sidebar", "hidden"],
+                    "enum": ["window", "card", "folder", "hidden"],
                     "default": "window",
                 },
                 "position": {
@@ -104,7 +104,7 @@ TOOL_DEFINITIONS = [
                 },
                 "presentation": {
                     "type": "string",
-                    "enum": ["window", "card", "sidebar", "hidden"],
+                    "enum": ["window", "card", "folder", "hidden"],
                 },
             },
             "required": ["id"],
@@ -125,7 +125,7 @@ TOOL_DEFINITIONS = [
                 },
                 "search": {
                     "type": "string",
-                    "description": "Full-text search query across content and summary",
+                    "description": "Full-text search query on summary field",
                 },
                 "presentation": {
                     "type": "string",
@@ -223,7 +223,7 @@ async def create_entity(client, space_id: str, user_id: str, params: dict) -> di
         "summary": params.get("summary"),
         "created_by": "agent",
     }
-    result = await client.table("entities").insert(row).execute()
+    result = await client.table("entities").insert(row).select("*").execute()
     return result.data[0] if result.data else row
 
 
@@ -314,6 +314,7 @@ async def update_entity(client, space_id: str, user_id: str, params: dict) -> di
         .update(updates)
         .eq("id", entity_id)
         .eq("space_id", space_id)
+        .select("*")
         .execute()
     )
     if isinstance(result.data, list) and result.data:
@@ -335,6 +336,53 @@ def _merge_patch(target: dict, patch: dict) -> dict:
         else:
             result[key] = value
     return result
+
+
+# ---------------------------------------------------------------------------
+# Batch positioning
+# ---------------------------------------------------------------------------
+
+
+def compute_group_positions(count: int, viewport: dict | None = None) -> list[dict]:
+    """Tile N entities in a grid centered at (50%, 50%).
+
+    Returns list of {x, y, locked} dicts in percentage coordinates.
+    Uses viewport dimensions to convert card pixel sizes to percentages.
+    """
+    import math
+
+    cols = math.ceil(math.sqrt(count))
+    rows = math.ceil(count / cols)
+
+    vw = (viewport or {}).get("width", 1440)
+    vh = (viewport or {}).get("height", 900)
+
+    card_w, card_h, gap = 232, 300, 20  # pixels
+    cell_w_pct = (card_w + gap) / vw * 100
+    cell_h_pct = (card_h + gap) / vh * 100
+
+    grid_w = cols * cell_w_pct
+    grid_h = rows * cell_h_pct
+    start_x = 50 - grid_w / 2 + cell_w_pct / 2
+    start_y = 50 - grid_h / 2 + cell_h_pct / 2
+
+    positions = []
+    for i in range(count):
+        col, row = i % cols, i // cols
+        x = max(5, min(95, start_x + col * cell_w_pct))
+        y = max(5, min(95, start_y + row * cell_h_pct))
+        positions.append({"x": round(x, 1), "y": round(y, 1), "locked": False})
+    return positions
+
+
+async def check_batch_image_quota(
+    client, user_id: str, count: int
+) -> tuple[bool, str]:
+    """Check if user can generate `count` images. Returns (allowed, reason).
+
+    Stub — always allows. Will be wired to usage_events + tier system in Phase 12.
+    """
+    return True, ""
 
 
 # ---------------------------------------------------------------------------

@@ -1,10 +1,19 @@
-"""Tests for agent/context.py — entity index and recent turns queries."""
+"""Tests for agent/context.py — entity index, recent turns, and context enrichment."""
+
+from datetime import datetime, timezone
 
 import pytest
 
-from tests.conftest import TEST_SPACE_ID
+from tests.conftest import TEST_SPACE_ID, TEST_USER_ID
 
-from agent.context import get_entity_index, get_recent_turns, build_system_prompt
+from agent.context import (
+    get_entity_index,
+    get_focused_entity,
+    get_recent_turns,
+    get_space_info,
+    get_user_profile,
+    build_system_prompt,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -230,23 +239,63 @@ class TestBuildSystemPrompt:
         assert "It is sunny today." in prompt
 
     async def test_system_prompt_contains_entity_state_shapes(self, mock_supabase):
-        """The prompt should describe state shapes for entity types."""
+        """The prompt should describe state shapes for note, calendar, calendar_event, and image."""
         mock_supabase.set_table_response("entities", [])
 
         prompt = await build_system_prompt(mock_supabase, TEST_SPACE_ID, "hello")
 
-        assert "A note entity has state:" in prompt
-        assert "A calendar entity has state:" in prompt
-        assert "An image entity has state:" in prompt
+        # Note uses entity-level content field, NOT state.content
+        assert "note:" in prompt
+        assert "content field" in prompt.lower() or "`content` field" in prompt
+        # Calendar is its own type — events are separate
+        assert "calendar:" in prompt
+        assert "calendar_event:" in prompt
+        # Image type documented
+        assert "image:" in prompt
+        # Old incorrect shapes must NOT be present
+        assert "A note entity has state:" not in prompt
+        assert "A calendar entity has state:" not in prompt
+        assert "{ events:" not in prompt
+        assert "{ title: string, content: string }" not in prompt
+
+    async def test_system_prompt_calendar_event_hidden(self, mock_supabase):
+        """calendar_event should be documented with presentation='hidden'."""
+        mock_supabase.set_table_response("entities", [])
+
+        prompt = await build_system_prompt(mock_supabase, TEST_SPACE_ID, "hello")
+
+        # calendar_event presentation must be hidden
+        assert "calendar_event:" in prompt
+        assert "hidden" in prompt
+
+    async def test_system_prompt_singleton_awareness(self, mock_supabase):
+        """Prompt should warn about singleton apps (chat, settings, sounds)."""
+        mock_supabase.set_table_response("entities", [])
+
+        prompt = await build_system_prompt(mock_supabase, TEST_SPACE_ID, "hello")
+
+        assert "singleton" in prompt.lower() or "chat" in prompt.lower()
+
+    async def test_system_prompt_presentation_modes(self, mock_supabase):
+        """Prompt should list correct presentation modes: window, card, folder, hidden."""
+        mock_supabase.set_table_response("entities", [])
+
+        prompt = await build_system_prompt(mock_supabase, TEST_SPACE_ID, "hello")
+
+        assert "window" in prompt
+        assert "card" in prompt
+        assert "folder" in prompt
+        assert "hidden" in prompt
+        # sidebar should NOT be mentioned
+        assert "sidebar" not in prompt.lower()
 
     async def test_image_state_shape_includes_generation_prompt(self, mock_supabase):
-        """Image entity state shape should reference generation_prompt, image_url, width, height."""
+        """Image entity state shape should reference generation_prompt."""
         mock_supabase.set_table_response("entities", [])
 
         prompt = await build_system_prompt(mock_supabase, TEST_SPACE_ID, "hello")
 
         assert "generation_prompt" in prompt
-        assert "image_url" in prompt
         # Should NOT reference the old url/alt shape
         assert "{ url: string, alt: string }" not in prompt
 
@@ -257,4 +306,311 @@ class TestBuildSystemPrompt:
         prompt = await build_system_prompt(mock_supabase, TEST_SPACE_ID, "hello")
 
         assert "generation_prompt" in prompt
-        assert "presentation" in prompt.lower() or "card" in prompt
+        assert "card" in prompt
+
+    async def test_system_prompt_contains_canvas_context(self, mock_supabase, make_entity):
+        """When viewport/focused/visible are provided, Canvas Context section appears."""
+        entities = [
+            make_entity(
+                entity_id="ent-abc",
+                entity_type="note",
+                presentation="window",
+                summary="Focused note",
+            ),
+        ]
+        mock_supabase.set_table_response("entities", entities)
+
+        prompt = await build_system_prompt(
+            mock_supabase, TEST_SPACE_ID, "hello",
+            viewport={"width": 1920, "height": 1080},
+            focused_entity_id="ent-abc",
+            visible_entity_ids=["ent-abc"],
+        )
+
+        assert "Canvas Context" in prompt
+        assert "1920" in prompt
+        assert "1080" in prompt
+        assert "Focused note" in prompt
+
+    async def test_system_prompt_omits_canvas_when_none(self, mock_supabase):
+        """When no canvas context is provided, no Canvas Context section appears."""
+        mock_supabase.set_table_response("entities", [])
+
+        prompt = await build_system_prompt(mock_supabase, TEST_SPACE_ID, "hello")
+
+        assert "Canvas Context" not in prompt
+
+    async def test_system_prompt_focused_entity_shows_summary(self, mock_supabase, make_entity):
+        """focused_entity_id should resolve to entity summary in the prompt."""
+        entities = [
+            make_entity(
+                entity_id="ent-123",
+                entity_type="calendar",
+                presentation="window",
+                summary="My Calendar",
+            ),
+            make_entity(
+                entity_id="ent-456",
+                entity_type="note",
+                presentation="window",
+                summary="Shopping list",
+            ),
+        ]
+        mock_supabase.set_table_response("entities", entities)
+
+        prompt = await build_system_prompt(
+            mock_supabase, TEST_SPACE_ID, "hello",
+            focused_entity_id="ent-123",
+        )
+
+        assert "Canvas Context" in prompt
+        assert "My Calendar" in prompt
+
+    async def test_system_prompt_visible_count(self, mock_supabase, make_entity):
+        """visible_entity_ids should show count of visible vs total entities."""
+        entities = [
+            make_entity(entity_id="ent-1", entity_type="note", summary="Note 1"),
+            make_entity(entity_id="ent-2", entity_type="note", summary="Note 2"),
+            make_entity(entity_id="ent-3", entity_type="note", summary="Note 3"),
+        ]
+        mock_supabase.set_table_response("entities", entities)
+
+        prompt = await build_system_prompt(
+            mock_supabase, TEST_SPACE_ID, "hello",
+            visible_entity_ids=["ent-1", "ent-2"],
+        )
+
+        assert "2 of 3" in prompt
+
+    async def test_system_prompt_contains_user_name(self, mock_supabase, make_entity):
+        """When user_id is provided and profile has a name, prompt includes it."""
+        mock_supabase.set_table_response("entities", [])
+        mock_supabase.set_table_response(
+            "users", [{"name": "Alice", "username": "alice", "avatar_url": None}]
+        )
+        mock_supabase.set_table_response("spaces", [])
+
+        prompt = await build_system_prompt(
+            mock_supabase, TEST_SPACE_ID, "hello", user_id=TEST_USER_ID
+        )
+
+        assert "Alice" in prompt
+        assert "User" in prompt
+
+    async def test_system_prompt_omits_user_when_no_id(self, mock_supabase):
+        """When user_id is None, no User section appears."""
+        mock_supabase.set_table_response("entities", [])
+
+        prompt = await build_system_prompt(mock_supabase, TEST_SPACE_ID, "hello")
+
+        assert "=== User ===" not in prompt
+
+    async def test_system_prompt_contains_temporal_context(self, mock_supabase):
+        """Prompt should include current date/time in UTC."""
+        mock_supabase.set_table_response("entities", [])
+
+        prompt = await build_system_prompt(mock_supabase, TEST_SPACE_ID, "hello")
+
+        assert "Current Date" in prompt
+        assert "UTC" in prompt
+        now = datetime.now(timezone.utc)
+        assert str(now.year) in prompt
+
+    async def test_system_prompt_with_timezone_shows_local_time(self, mock_supabase):
+        """When timezone is provided, prompt should show local time with timezone name."""
+        mock_supabase.set_table_response("entities", [])
+
+        prompt = await build_system_prompt(
+            mock_supabase, TEST_SPACE_ID, "hello",
+            user_timezone="Europe/Bucharest",
+        )
+
+        assert "Current Date" in prompt
+        assert "Europe/Bucharest" in prompt
+        # Should NOT show "UTC" as the timezone label
+        # (the time string itself should reference the user's timezone)
+        lines = [l for l in prompt.split("\n") if "Current Date" in l or "Europe/Bucharest" in l]
+        assert any("Europe/Bucharest" in l for l in lines)
+
+    async def test_system_prompt_without_timezone_defaults_to_utc(self, mock_supabase):
+        """When no timezone is provided, prompt should show UTC (backward compat)."""
+        mock_supabase.set_table_response("entities", [])
+
+        prompt = await build_system_prompt(mock_supabase, TEST_SPACE_ID, "hello")
+
+        assert "UTC" in prompt
+
+    async def test_system_prompt_with_timezone_instructs_local_datetimes(self, mock_supabase):
+        """When timezone is provided, calendar_event example should reference user's timezone."""
+        mock_supabase.set_table_response("entities", [])
+
+        prompt = await build_system_prompt(
+            mock_supabase, TEST_SPACE_ID, "hello",
+            user_timezone="Europe/Bucharest",
+        )
+
+        # The prompt should instruct the agent to use the user's local timezone
+        assert "Europe/Bucharest" in prompt
+        # Should contain guidance about using local time for calendar events
+        assert "local time" in prompt.lower() or "user's timezone" in prompt.lower()
+
+    async def test_system_prompt_contains_current_request(self, mock_supabase):
+        """The user's current message should be clearly labeled in the prompt."""
+        mock_supabase.set_table_response("entities", [])
+
+        prompt = await build_system_prompt(
+            mock_supabase, TEST_SPACE_ID, "edit this note please"
+        )
+
+        assert "=== Current Request ===" in prompt
+        assert "edit this note please" in prompt
+
+    async def test_current_request_is_last_section(self, mock_supabase):
+        """Current request should be the final section in the prompt."""
+        mock_supabase.set_table_response("entities", [])
+
+        prompt = await build_system_prompt(
+            mock_supabase, TEST_SPACE_ID, "schedule meeting for tomorrow"
+        )
+
+        # Current request should come after temporal context
+        date_pos = prompt.index("Current Date")
+        request_pos = prompt.index("Current Request")
+        assert request_pos > date_pos
+
+    async def test_system_prompt_contains_space_name(self, mock_supabase):
+        """When space has a name, prompt includes it."""
+        mock_supabase.set_table_response("entities", [])
+        mock_supabase.set_table_response("spaces", [{"name": "My Workspace"}])
+
+        prompt = await build_system_prompt(mock_supabase, TEST_SPACE_ID, "hello")
+
+        assert "My Workspace" in prompt
+        assert "Space:" in prompt
+
+    async def test_system_prompt_focused_entity_shows_content(
+        self, mock_supabase, make_entity
+    ):
+        """Focused entity should include its content and state in the prompt."""
+        entities = [
+            make_entity(
+                entity_id="ent-focused",
+                entity_type="note",
+                presentation="window",
+                summary="Shopping list",
+                content="# Shopping\n- Milk\n- Eggs",
+                state={"checked": True},
+            ),
+        ]
+        mock_supabase.set_table_response("entities", entities)
+
+        prompt = await build_system_prompt(
+            mock_supabase, TEST_SPACE_ID, "hello",
+            focused_entity_id="ent-focused",
+        )
+
+        assert "Shopping list" in prompt
+        assert "# Shopping" in prompt
+        assert "Milk" in prompt
+        assert "checked" in prompt
+
+
+# ---------------------------------------------------------------------------
+# TestUserProfile (Phase 19.1)
+# ---------------------------------------------------------------------------
+
+
+class TestUserProfile:
+    """get_user_profile fetches the user's name from the users table."""
+
+    async def test_profile_found_returns_name(self, mock_supabase):
+        """When user exists, return their profile dict."""
+        mock_supabase.set_table_response(
+            "users", [{"name": "Alice", "username": "alice", "avatar_url": None}]
+        )
+
+        result = await get_user_profile(mock_supabase, TEST_USER_ID)
+
+        assert result is not None
+        assert result["name"] == "Alice"
+
+    async def test_profile_not_found_returns_none(self, mock_supabase):
+        """When user doesn't exist, return None."""
+        mock_supabase.set_table_response("users", [])
+
+        result = await get_user_profile(mock_supabase, "nonexistent-id")
+
+        assert result is None
+
+    async def test_profile_without_name(self, mock_supabase):
+        """When user exists but has no name, return the profile (caller decides)."""
+        mock_supabase.set_table_response(
+            "users", [{"name": None, "username": "ghost", "avatar_url": None}]
+        )
+
+        result = await get_user_profile(mock_supabase, TEST_USER_ID)
+
+        assert result is not None
+        assert result["name"] is None
+
+
+# ---------------------------------------------------------------------------
+# TestSpaceInfo (Phase 19.2)
+# ---------------------------------------------------------------------------
+
+
+class TestSpaceInfo:
+    """get_space_info fetches the space name."""
+
+    async def test_space_found_returns_name(self, mock_supabase):
+        """When space exists, return dict with name."""
+        mock_supabase.set_table_response("spaces", [{"name": "My Workspace"}])
+
+        result = await get_space_info(mock_supabase, TEST_SPACE_ID)
+
+        assert result is not None
+        assert result["name"] == "My Workspace"
+
+    async def test_space_not_found_returns_none(self, mock_supabase):
+        """When space doesn't exist, return None."""
+        mock_supabase.set_table_response("spaces", [])
+
+        result = await get_space_info(mock_supabase, "nonexistent-id")
+
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# TestFocusedEntity (Phase 19 enrichment)
+# ---------------------------------------------------------------------------
+
+
+class TestFocusedEntity:
+    """get_focused_entity fetches full entity content and state."""
+
+    async def test_entity_found_returns_content_and_state(
+        self, mock_supabase, make_entity
+    ):
+        """When entity exists, return dict with content and state."""
+        entity = make_entity(
+            entity_id="ent-abc",
+            entity_type="note",
+            content="Hello world",
+            state={"draft": True},
+            summary="A note",
+        )
+        mock_supabase.set_table_response("entities", [entity])
+
+        result = await get_focused_entity(mock_supabase, TEST_SPACE_ID, "ent-abc")
+
+        assert result is not None
+        assert result["content"] == "Hello world"
+        assert result["state"] == {"draft": True}
+
+    async def test_entity_not_found_returns_none(self, mock_supabase):
+        """When entity doesn't exist, return None."""
+        mock_supabase.set_table_response("entities", [])
+
+        result = await get_focused_entity(mock_supabase, TEST_SPACE_ID, "missing-id")
+
+        assert result is None

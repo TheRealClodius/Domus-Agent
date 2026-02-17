@@ -51,6 +51,13 @@ class TestCreateEntity:
         expected_props = {"type", "content", "presentation", "position", "size", "state", "summary"}
         assert set(props.keys()) == expected_props
 
+    def test_presentation_enum_has_folder_not_sidebar(self):
+        defn = self._get_defn()
+        enum = defn["input_schema"]["properties"]["presentation"]["enum"]
+        assert "folder" in enum
+        assert "sidebar" not in enum
+        assert set(enum) == {"window", "card", "folder", "hidden"}
+
 
 class TestUpdateEntity:
     """update_entity tool definition."""
@@ -67,6 +74,12 @@ class TestUpdateEntity:
         props = defn["input_schema"]["properties"]
         expected_props = {"id", "content", "state", "summary", "position", "size", "presentation"}
         assert set(props.keys()) == expected_props
+
+    def test_presentation_enum_has_folder_not_sidebar(self):
+        defn = self._get_defn()
+        enum = defn["input_schema"]["properties"]["presentation"]["enum"]
+        assert "folder" in enum
+        assert "sidebar" not in enum
 
 
 class TestQueryEntities:
@@ -88,6 +101,13 @@ class TestQueryEntities:
             "include_archived", "limit",
         }
         assert set(props.keys()) == expected_props
+
+    def test_search_description_says_summary_only(self):
+        """Search description should say 'summary' not 'content and summary'."""
+        defn = self._get_defn()
+        desc = defn["input_schema"]["properties"]["search"]["description"]
+        assert "summary" in desc
+        assert "content and summary" not in desc
 
 
 class TestReadEntity:
@@ -858,3 +878,104 @@ class TestCreateEntityImageWiring:
         )
 
         mock_gen.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# compute_group_positions tests
+# ---------------------------------------------------------------------------
+
+
+from agent.tools import compute_group_positions
+
+
+class TestComputeGroupPositions:
+    """compute_group_positions tiles N entities in a grid centered at (50, 50)."""
+
+    def test_single_entity_centered(self):
+        """1 entity → single position at {x: 50, y: 50}."""
+        positions = compute_group_positions(1)
+        assert len(positions) == 1
+        assert positions[0]["x"] == 50.0
+        assert positions[0]["y"] == 50.0
+        assert positions[0]["locked"] is False
+
+    def test_four_entities_2x2_grid(self):
+        """4 entities → 2x2 grid, all positions distinct, centered around 50/50."""
+        positions = compute_group_positions(4)
+        assert len(positions) == 4
+        # All positions should be distinct
+        coords = [(p["x"], p["y"]) for p in positions]
+        assert len(set(coords)) == 4
+        # Average should be near center
+        avg_x = sum(p["x"] for p in positions) / 4
+        avg_y = sum(p["y"] for p in positions) / 4
+        assert abs(avg_x - 50) < 1
+        assert abs(avg_y - 50) < 1
+
+    def test_nine_entities_3x3_grid(self):
+        """9 entities → 3x3 grid."""
+        positions = compute_group_positions(9)
+        assert len(positions) == 9
+        coords = [(p["x"], p["y"]) for p in positions]
+        assert len(set(coords)) == 9
+
+    def test_ten_entities_grid(self):
+        """10 entities → 4 cols (ceil(sqrt(10))=4), 3 rows."""
+        positions = compute_group_positions(10)
+        assert len(positions) == 10
+        coords = [(p["x"], p["y"]) for p in positions]
+        assert len(set(coords)) == 10
+
+    def test_positions_clamped_to_valid_range(self):
+        """All positions should be within [5, 95] range."""
+        # Large batch that could push positions outside bounds
+        positions = compute_group_positions(25)
+        for p in positions:
+            assert 5 <= p["x"] <= 95, f"x={p['x']} out of range"
+            assert 5 <= p["y"] <= 95, f"y={p['y']} out of range"
+
+    def test_custom_viewport_changes_spacing(self):
+        """Custom viewport dimensions should change percentage spacing."""
+        pos_default = compute_group_positions(4)
+        pos_wide = compute_group_positions(4, viewport={"width": 2880, "height": 900})
+        # Wider viewport → smaller percentage spacing between cards
+        # So positions should be closer together on x-axis
+        x_spread_default = max(p["x"] for p in pos_default) - min(p["x"] for p in pos_default)
+        x_spread_wide = max(p["x"] for p in pos_wide) - min(p["x"] for p in pos_wide)
+        assert x_spread_wide < x_spread_default
+
+    def test_none_viewport_uses_defaults(self):
+        """None viewport should use 1440x900 defaults (same as no viewport)."""
+        pos_none = compute_group_positions(4, viewport=None)
+        pos_default = compute_group_positions(4)
+        assert pos_none == pos_default
+
+    def test_all_positions_have_locked_false(self):
+        """Every position dict should have locked=False."""
+        positions = compute_group_positions(6)
+        for p in positions:
+            assert p["locked"] is False
+
+
+# ---------------------------------------------------------------------------
+# check_batch_image_quota stub tests
+# ---------------------------------------------------------------------------
+
+
+from agent.tools import check_batch_image_quota
+
+
+class TestCheckBatchImageQuota:
+    """check_batch_image_quota is a stub that always allows."""
+
+    async def test_always_returns_allowed(self):
+        """Stub should return (True, '') for any count."""
+        allowed, reason = await check_batch_image_quota(None, "user-123", 10)
+        assert allowed is True
+        assert reason == ""
+
+    async def test_returns_tuple(self):
+        """Return type is (bool, str)."""
+        result = await check_batch_image_quota(None, "user-456", 1)
+        assert isinstance(result, tuple)
+        assert len(result) == 2

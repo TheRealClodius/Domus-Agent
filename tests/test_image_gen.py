@@ -221,3 +221,117 @@ class TestGenerateImage:
         filename = result["storage_path"].split("/")[-1].replace(".png", "")
         # Should be a valid UUID
         uuid.UUID(filename)  # Raises ValueError if not valid
+
+
+# ---------------------------------------------------------------------------
+# _generate_image_sync and asyncio.to_thread tests
+# ---------------------------------------------------------------------------
+
+
+class TestGenerateImageSync:
+    """_generate_image_sync extracts the sync Gemini+PIL work."""
+
+    def _make_gemini_response(self, image_bytes: bytes):
+        inline_data = MagicMock()
+        inline_data.data = image_bytes
+        inline_data.mime_type = "image/png"
+        part = MagicMock()
+        part.inline_data = inline_data
+        content = MagicMock()
+        content.parts = [part]
+        candidate = MagicMock()
+        candidate.content = content
+        response = MagicMock()
+        response.candidates = [candidate]
+        return response
+
+    def _make_png_bytes(self, width=64, height=64) -> bytes:
+        from PIL import Image
+        img = Image.new("RGB", (width, height), color=(0, 255, 0))
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+
+    def test_returns_png_bytes_and_dimensions(self):
+        """_generate_image_sync returns (png_bytes, width, height)."""
+        png_bytes = self._make_png_bytes(100, 200)
+        gemini_response = self._make_gemini_response(png_bytes)
+
+        mock_client = MagicMock()
+        mock_client.models.generate_content.return_value = gemini_response
+
+        with patch("agent.image_gen.genai.Client", return_value=mock_client):
+            from agent.image_gen import _generate_image_sync
+            result = _generate_image_sync("test prompt", "test-key")
+
+        assert isinstance(result, tuple)
+        assert len(result) == 3
+        png_data, w, h = result
+        assert isinstance(png_data, bytes)
+        assert w == 100
+        assert h == 200
+
+    def test_output_is_valid_png(self):
+        """The returned bytes should be a valid PNG image."""
+        from PIL import Image
+
+        png_bytes = self._make_png_bytes(50, 50)
+        gemini_response = self._make_gemini_response(png_bytes)
+
+        mock_client = MagicMock()
+        mock_client.models.generate_content.return_value = gemini_response
+
+        with patch("agent.image_gen.genai.Client", return_value=mock_client):
+            from agent.image_gen import _generate_image_sync
+            png_data, _, _ = _generate_image_sync("test", "key")
+
+        img = Image.open(io.BytesIO(png_data))
+        assert img.format == "PNG"
+
+
+class TestGenerateImageUsesToThread:
+    """generate_image should call asyncio.to_thread with _generate_image_sync."""
+
+    def _make_png_bytes(self, width=64, height=64) -> bytes:
+        from PIL import Image
+        img = Image.new("RGB", (width, height), color=(0, 0, 255))
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+
+    @patch("agent.image_gen.config")
+    @patch("agent.image_gen.asyncio.to_thread", new_callable=AsyncMock)
+    async def test_calls_to_thread_with_sync_function(self, mock_to_thread, mock_config):
+        """generate_image should await asyncio.to_thread(_generate_image_sync, ...)."""
+        mock_config.GOOGLE_API_KEY = "test-key"
+        png_bytes = self._make_png_bytes()
+        mock_to_thread.return_value = (png_bytes, 64, 64)
+
+        client = MockSupabaseWithStorage()
+
+        from agent.image_gen import generate_image, _generate_image_sync
+        result = await generate_image("a cat", TEST_SPACE_ID, client)
+
+        mock_to_thread.assert_called_once()
+        call_args = mock_to_thread.call_args
+        assert call_args[0][0] is _generate_image_sync
+        assert call_args[0][1] == "a cat"
+        assert call_args[0][2] == "test-key"
+
+    @patch("agent.image_gen.config")
+    @patch("agent.image_gen.asyncio.to_thread", new_callable=AsyncMock)
+    async def test_supabase_upload_happens_after_thread(self, mock_to_thread, mock_config):
+        """Supabase upload should still happen async after to_thread returns."""
+        mock_config.GOOGLE_API_KEY = "test-key"
+        png_bytes = self._make_png_bytes()
+        mock_to_thread.return_value = (png_bytes, 64, 64)
+
+        client = MockSupabaseWithStorage()
+
+        from agent.image_gen import generate_image
+        result = await generate_image("test", TEST_SPACE_ID, client)
+
+        bucket = client.storage.from_("images")
+        assert len(bucket.uploaded) == 1
+        assert result["width"] == 64
+        assert result["height"] == 64

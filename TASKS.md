@@ -224,7 +224,7 @@ Test: mock `httpx` to return a Perplexity-shaped response. Verify answer and cit
 
 The image pipeline. Fully in-memory: Supabase Storage ↔ BytesIO ↔ PIL ↔ Gemini.
 
-### 8.1 — Generate from prompt (`agent/image_gen.py`)
+### 8.1 — Generate from prompt (`agent/image_gen.py`) ✅
 
 `generate_image(prompt, space_id) → dict`. Pipeline:
 1. Call Gemini (`gemini-2.5-flash-image`) via `google-genai` SDK: `client.models.generate_content([prompt])`, with `response_modalities=["IMAGE"]`
@@ -238,7 +238,7 @@ Add `GEMINI_API_KEY` to `config.py` (optional — like Perplexity).
 
 Test: mock Gemini client and Supabase Storage. Verify the full pipeline: prompt in → image bytes extracted → uploaded to storage → URL returned.
 
-### 8.2 — Wire into `create_entity`
+### 8.2 — Wire into `create_entity` (partial ✅)
 
 When `create_entity` is called with `type='image'` and `state.generation_prompt` is present:
 1. Call `generate_image(state.generation_prompt, space_id)`
@@ -479,7 +479,9 @@ Test: trigger agent runs, scrape `/metrics`, verify counters increment and histo
 
 Users send images and files in the chat, not just text.
 
-### 14.1 — Image input (vision)
+### 14.1 — Image input (vision) ✅
+
+*Implementation note: frontend sends base64 data URLs in `context_items` instead of `storage_path`. Agent receives pre-encoded attachments rather than downloading from Storage.*
 
 Update the `/agent` endpoint payload to accept attachments:
 ```json
@@ -500,7 +502,9 @@ In `agent/loop.py`:
 
 Test: mock Supabase Storage download + Anthropic. Send a message with an image attachment. Verify Claude receives an image content block. Verify the agent can respond about the image.
 
-### 14.2 — File processing
+### 14.2 — File processing ✅
+
+*Implementation note: logic is inlined in `_build_multimodal_content()` in loop.py rather than a standalone `process_attachment` function. Same behavior — images, PDFs, and text/CSV all handled.*
 
 Handle file attachments (PDF, CSV, plain text):
 ```json
@@ -706,6 +710,78 @@ Minimal set for v1:
 Templates are plain Python string formatting — no template engine. HTML + plain text variants.
 
 Test: render each template with sample data. Verify HTML and plain text output contain expected content. Verify links are correctly formatted.
+
+---
+
+## Phase 19: Agent Context Gaps
+
+The agent is missing critical context — who the user is, what time it is, and whether its tools actually work for certain app types. These gaps cause broken experiences that fail silently.
+
+### 19.1 — User profile in context (partial ✅)
+
+*Done: `get_user_profile`, `get_space_info`, `get_focused_entity`, user name + space name in prompt. Not done: caching with TTL, email in profile.*
+
+Authenticated user information (email, name, surname) is stored in profile data but never reaches the agent. Inject it into the context stack immediately after the system prompt.
+
+1. `get_user_profile(user_id) → dict`. Query Supabase for the user's profile (email, first name, last name). Cache in-memory with TTL (profile data doesn't change often — 15 min TTL is fine).
+2. Update `build_system_prompt` in `agent/context.py`: insert a `=== User Profile ===` section right after base instructions, before entity index. Include name, email. If profile is incomplete (guest, missing fields), omit the section or include what's available.
+3. The agent can now address users by name, personalize responses, and reference their identity.
+
+Test: mock Supabase profile query. Build system prompt with a profile present — verify name/email appear in the correct section. Build without profile (guest) — verify section is omitted gracefully. Verify caching works (second call doesn't hit Supabase).
+
+### 19.2 — Temporal context (partial ✅)
+
+*Done: date/time in UTC in system prompt. Not done: user timezone inference, calendar integration (upcoming events).*
+
+The agent has no awareness of the current date or time. Append temporal context at the end of the context stack, right before the user's message.
+
+1. Update `build_system_prompt` in `agent/context.py`: add a `=== Temporal Context ===` section at the end of the prompt. Include current date, day of week, and time of day (in the user's timezone if known, UTC otherwise).
+2. **Calendar integration:** if the user has a connected calendar, pull temporal context from there instead — today's schedule, upcoming events, current/next event. This gives the agent richer time awareness ("you have a meeting in 30 minutes") rather than just the raw timestamp.
+3. Format example:
+   ```
+   === Temporal Context ===
+   Monday, 17 February 2026, 14:30 UTC
+   ```
+   Or with calendar:
+   ```
+   === Temporal Context ===
+   Monday, 17 February 2026, 14:30 UTC
+   Next event: "Team standup" at 15:00 (in 30 minutes)
+   Today's remaining: 2 events
+   ```
+
+Test: build system prompt, verify temporal section appears at the end. Verify date/time formatting. Test with and without calendar data. Verify timezone handling.
+
+### 19.4 — User facts in context stack
+
+Compaction (Phase 6) extracts `fact` entities from conversation history, but they never reach the agent's system prompt. The agent forgets everything it learned about the user between sessions.
+
+1. `get_user_facts(client, space_id) → list[dict]`. Query `fact` entities (`type='fact'`, `presentation='hidden'`, non-archived) for the space. Return `state.content` and `state.confidence` for each.
+2. Update `build_system_prompt` in `agent/context.py`: inject facts into the `=== User ===` section, right after the user's name. Format as a bulleted list:
+   ```
+   === User ===
+   The user's name is Alice.
+   - Prefers dark mode
+   - Software engineer at Acme Corp
+   - Likes concise responses
+   ```
+3. If no facts exist (new user, no compaction yet), omit the bullet list — just show the name.
+4. Cap at ~20 facts to avoid bloating the prompt. Order by confidence descending so the most reliable facts appear first.
+
+Depends on: Phase 6 (compaction creates fact entities), 19.1 (user profile section exists to attach facts to).
+
+Test: create fact entities in the space, build system prompt, verify facts appear in the User section after the name. Verify ordering by confidence. Verify cap at 20. Verify empty facts case shows name only.
+
+### 19.3 — App tool reliability audit
+
+The agent claims it can create calendar events (and other app types) but operations fail silently — no events are actually created, and no errors surface to the user or the agent. This is a critical trust-breaking bug.
+
+1. **Diagnose:** Audit the full tool execution path for every app type the agent claims to support (calendar events, todos, etc.). Trace from Claude's tool_use → `execute_tool` → Supabase write. Identify where failures are swallowed — likely missing error propagation, schema mismatches, or Supabase rejecting writes without the agent knowing.
+2. **Fix silent failures:** Ensure every tool execution either succeeds and returns the created/updated entity, or fails and returns a clear error that Claude can communicate to the user. No silent drops. Log all tool failures with full context (tool name, params, error).
+3. **App type coverage:** Verify that the entity types the agent talks about (calendar, tasks, etc.) actually have working create/update paths. If a type isn't supported yet, the agent should know — either via schema validation (11.2) or explicit type awareness in the system prompt — so it can tell the user honestly instead of hallucinating success.
+4. **Surface errors to the agent:** If a tool call fails, the error result must be clear enough for Claude to explain what went wrong and suggest alternatives. Never return a generic "error occurred" — include what failed and why.
+
+Test: create entities of every supported app type, verify they persist in Supabase. Intentionally trigger failures (invalid state, missing required fields), verify errors propagate back to Claude. Verify the agent communicates failures to the user instead of pretending success.
 
 ---
 

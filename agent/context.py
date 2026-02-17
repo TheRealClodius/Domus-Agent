@@ -1,4 +1,8 @@
-"""Context builders — entity index and recent turns for the agent system prompt."""
+"""Context builders — entity index, recent turns, and enrichment for the agent system prompt."""
+
+import json
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 
 async def get_entity_index(client, space_id: str) -> list[dict]:
@@ -35,6 +39,52 @@ async def get_recent_turns(client, space_id: str, limit: int = 5) -> list[dict]:
     return result.data
 
 
+async def get_user_profile(client, user_id: str) -> dict | None:
+    """Fetch user name/username from the users table.
+
+    Returns the row dict or None if not found (guest/anonymous).
+    """
+    result = await (
+        client.table("users")
+        .select("name, username, avatar_url")
+        .eq("id", user_id)
+        .maybe_single()
+        .execute()
+    )
+    return result.data
+
+
+async def get_space_info(client, space_id: str) -> dict | None:
+    """Fetch the space name.
+
+    Returns dict with 'name' or None if not found.
+    """
+    result = await (
+        client.table("spaces")
+        .select("name")
+        .eq("id", space_id)
+        .maybe_single()
+        .execute()
+    )
+    return result.data
+
+
+async def get_focused_entity(client, space_id: str, entity_id: str) -> dict | None:
+    """Fetch full entity content and state for the focused entity.
+
+    Returns dict with id, type, content, state, summary, presentation — or None.
+    """
+    result = await (
+        client.table("entities")
+        .select("id, type, content, state, summary, presentation")
+        .eq("id", entity_id)
+        .eq("space_id", space_id)
+        .maybe_single()
+        .execute()
+    )
+    return result.data
+
+
 # ---------------------------------------------------------------------------
 # System prompt assembly (task 2.3)
 # ---------------------------------------------------------------------------
@@ -43,33 +93,80 @@ async def get_recent_turns(client, space_id: str, limit: int = 5) -> list[dict]:
 _BASE_INSTRUCTIONS = """You are Domus, an intelligent spatial assistant. You help users organize their space by creating and managing entities.
 
 You have access to these tools:
-- create_entity: Create new entities (notes, calendars, images, etc.)
+- create_entity: Create new entities (notes, calendars, images, calendar events, etc.)
 - update_entity: Update existing entities using JSON Merge Patch
 - query_entities: Search and filter entities in the space
 - read_entity: Get full details of a specific entity
 
-When creating entities, always provide a clear summary. Use the appropriate entity type and presentation mode.
+When creating entities, always provide a clear summary.
 
-Entity state shapes:
-- A note entity has state: { title: string, content: string }
-- A calendar entity has state: { events: [{ title, start, end }] }
-- An image entity has state: { generation_prompt: string, image_url: string, width: number, height: number }
+=== Entity Types & State Shapes ===
 
-When creating images, set type='image' with state.generation_prompt. The system generates the image automatically. Use presentation='card'.
+note:
+  Use the entity-level `content` field for the note body (markdown text).
+  state: {} (empty — content lives in the `content` field, not state)
+  presentation: 'window'
+  Example: create_entity(type='note', content='# Shopping\\n- Milk\\n- Eggs', summary='Shopping list')
 
-Entities can be presented as: window, card, sidebar, or hidden.
+image:
+  state: { generation_prompt: string }
+  The system generates the image automatically from the prompt. Do NOT set image_url — it's filled in by the pipeline.
+  presentation: 'card'
+  Example: create_entity(type='image', state={ generation_prompt: 'a sunset over mountains' }, summary='Sunset landscape')
+
+calendar:
+  The calendar app window. There should only be ONE per space. Do NOT create duplicates.
+  state: { view: 'month' | 'week' | 'day' | 'agenda', selected_date: 'YYYY-MM-DD' }
+  Do NOT put events in the calendar entity. Events are separate entities (see calendar_event).
+  presentation: 'window'
+
+calendar_event:
+  A single calendar event. Always use presentation='hidden' — the calendar app reads these automatically.
+  state: { title: string, start: ISO datetime, end: ISO datetime, all_day: boolean, color?: 'default' | 'warm' | 'cool' | 'muted' }
+  presentation: 'hidden'
+  Example: create_entity(type='calendar_event', presentation='hidden', state={ title: 'Team standup', start: '2026-02-17T15:00:00Z', end: '2026-02-17T15:30:00Z', all_day: false }, summary='Team standup at 3pm')
+
+=== Singleton Apps (do NOT create duplicates) ===
+chat, settings, sounds — these are built-in apps limited to one instance per space. Only update existing ones if the user asks.
+
+=== Presentation Modes ===
+window: Full draggable window (default for most entities)
+card: Smaller canvas card (default for images)
+folder: Grouped stack of entities
+hidden: Not rendered on canvas (use for calendar_event, conversation_turn, facts, edges)
 """
 
 
-async def build_system_prompt(client, space_id: str, message: str) -> str:
+async def build_system_prompt(
+    client, space_id: str, message: str,
+    viewport: dict | None = None,
+    focused_entity_id: str | None = None,
+    visible_entity_ids: list[str] | None = None,
+    user_id: str | None = None,
+    user_timezone: str | None = None,
+) -> str:
     """Assemble the system prompt for a given space and message.
 
     Combines:
     1. Base instructions (agent identity, tool descriptions, state shapes)
-    2. Entity index from the space
-    3. Recent conversation turns
+    2. Space name + user profile
+    3. Entity index from the space
+    4. Canvas context (viewport, focused entity with content, visible entities)
+    5. Recent conversation turns
+    6. Current date and time
     """
     parts = [_BASE_INSTRUCTIONS.strip()]
+
+    # Space name
+    space_info = await get_space_info(client, space_id)
+    if space_info and space_info.get("name"):
+        parts.append(f"=== Space: {space_info['name']} ===")
+
+    # User profile
+    if user_id:
+        profile = await get_user_profile(client, user_id)
+        if profile and profile.get("name"):
+            parts.append(f"=== User ===\nThe user's name is {profile['name']}.")
 
     # Entity index
     entities = await get_entity_index(client, space_id)
@@ -86,6 +183,43 @@ async def build_system_prompt(client, space_id: str, message: str) -> str:
     else:
         parts.append("## Current entities in this space:\nNo entities yet.")
 
+    # Canvas context
+    canvas_lines = []
+    if viewport:
+        canvas_lines.append(
+            f"Viewport: {viewport.get('width', '?')}\u00d7{viewport.get('height', '?')}"
+        )
+    if focused_entity_id:
+        focused_full = await get_focused_entity(client, space_id, focused_entity_id)
+        if focused_full:
+            canvas_lines.append(
+                f"Focused: [{focused_full.get('type', '?')}] {focused_full['id']}: "
+                f"{focused_full.get('summary', '(no summary)')}"
+            )
+            content = focused_full.get("content")
+            if content:
+                if len(content) > 2000:
+                    content = content[:2000] + "... (truncated)"
+                canvas_lines.append(f"Content: {content}")
+            state = focused_full.get("state")
+            if state:
+                canvas_lines.append(f"State: {json.dumps(state)}")
+        else:
+            # Fallback to entity index lookup
+            focused = next((e for e in entities if e["id"] == focused_entity_id), None)
+            if focused:
+                canvas_lines.append(
+                    f"Focused: [{focused['type']}] {focused['id']}: "
+                    f"{focused.get('summary', '(no summary)')}"
+                )
+    if visible_entity_ids:
+        visible_count = len(visible_entity_ids)
+        total_count = len(entities) if entities else 0
+        canvas_lines.append(f"Visible: {visible_count} of {total_count} entities on screen")
+
+    if canvas_lines:
+        parts.append("=== Canvas Context ===\n" + "\n".join(canvas_lines))
+
     # Recent turns
     turns = await get_recent_turns(client, space_id)
     if turns:
@@ -96,5 +230,28 @@ async def build_system_prompt(client, space_id: str, message: str) -> str:
             content = state.get("content", "")
             turn_lines.append(f"{role}: {content}")
         parts.append("## Recent conversation:\n" + "\n".join(turn_lines))
+
+    # Temporal context
+    now_utc = datetime.now(timezone.utc)
+    if user_timezone:
+        try:
+            tz = ZoneInfo(user_timezone)
+            local_now = now_utc.astimezone(tz)
+            time_str = local_now.strftime(f"%A, %d %B %Y, %H:%M ({user_timezone})")
+            parts.append(f"=== Current Date & Time ===\n{time_str}")
+            parts.append(
+                f"=== User Timezone ===\n"
+                f"The user is in {user_timezone}. "
+                f"When creating calendar events, use the user's local time for start/end datetimes."
+            )
+        except KeyError:
+            time_str = now_utc.strftime("%A, %d %B %Y, %H:%M UTC")
+            parts.append(f"=== Current Date & Time ===\n{time_str}")
+    else:
+        time_str = now_utc.strftime("%A, %d %B %Y, %H:%M UTC")
+        parts.append(f"=== Current Date & Time ===\n{time_str}")
+
+    # Current user request — clearly marked so the agent knows what to respond to
+    parts.append(f"=== Current Request ===\n{message}")
 
     return "\n\n".join(parts)

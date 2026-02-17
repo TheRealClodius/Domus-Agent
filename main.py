@@ -74,6 +74,8 @@ class AgentRequest(BaseModel):
     viewport: dict | None = None
     focused_entity_id: str | None = None
     visible_entity_ids: list[str] | None = None
+    context_items: list[dict] | None = None
+    user_timezone: str | None = None
 
 
 @app.post("/agent", dependencies=[Depends(verify_service_auth)])
@@ -96,6 +98,11 @@ async def agent_endpoint(req: AgentRequest):
                 user_id=req.user_id,
                 message=req.message,
                 on_event=on_event,
+                viewport=req.viewport,
+                focused_entity_id=req.focused_entity_id,
+                visible_entity_ids=req.visible_entity_ids,
+                context_items=req.context_items,
+                user_timezone=req.user_timezone,
             )
         )
         terminal_event_sent = False

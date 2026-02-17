@@ -141,13 +141,19 @@ class TestSSEEvents:
         assert parsed["content"] == "Hello!"
 
     def test_tool_call_start_event_format(self):
-        """format_sse_event with tool_call_start includes tool name and id."""
-        event = {"type": "tool_call_start", "tool": "create_entity", "id": "tool_abc"}
+        """format_sse_event with tool_call_start includes tool name, id, and args."""
+        event = {
+            "type": "tool_call_start",
+            "tool": "create_entity",
+            "id": "tool_abc",
+            "args": {"type": "note", "state": {"title": "My Note"}},
+        }
         result = format_sse_event(event)
         parsed = json.loads(result.removeprefix("data: ").strip())
         assert parsed["type"] == "tool_call_start"
         assert parsed["tool"] == "create_entity"
         assert parsed["id"] == "tool_abc"
+        assert parsed["args"] == {"type": "note", "state": {"title": "My Note"}}
 
     def test_tool_call_result_event_format(self):
         """format_sse_event with tool_call_result includes the result dict."""
@@ -213,6 +219,39 @@ class TestSSEEvents:
             "text_delta",
             "done",
         ]
+
+    @patch("agent.loop.build_system_prompt", new_callable=AsyncMock, return_value="test prompt")
+    @patch("agent.loop.execute_tool", new_callable=AsyncMock, return_value={"id": "entity-1", "type": "note"})
+    async def test_tool_call_start_includes_args(
+        self, mock_execute, mock_prompt, mock_supabase
+    ):
+        """tool_call_start event should include the tool's input args."""
+        tool_input = {"type": "note", "state": {"title": "My Note"}}
+        mock_anthropic = MagicMock()
+        mock_anthropic.messages.create = AsyncMock(
+            side_effect=[
+                _make_tool_response("create_entity", "tool_1", tool_input),
+                _make_text_response("Done!"),
+            ]
+        )
+
+        events = []
+
+        async def collect_event(event):
+            events.append(event)
+
+        await run_agent(
+            mock_supabase,
+            mock_anthropic,
+            TEST_SPACE_ID,
+            TEST_USER_ID,
+            "Create a note",
+            on_event=collect_event,
+        )
+
+        start_events = [e for e in events if e["type"] == "tool_call_start"]
+        assert len(start_events) == 1
+        assert start_events[0]["args"] == tool_input
 
 
 # ---------------------------------------------------------------------------
@@ -506,6 +545,444 @@ class TestMultiTurnAgent:
 # ---------------------------------------------------------------------------
 # Logging in loop.py
 # ---------------------------------------------------------------------------
+
+
+class TestContextItems:
+    """run_agent converts context_items (file attachments) to Claude content blocks."""
+
+    @patch("agent.loop.build_system_prompt", new_callable=AsyncMock, return_value="test prompt")
+    async def test_context_items_image_becomes_image_block(self, mock_prompt, mock_supabase):
+        """An image data URL in context_items becomes a Claude image content block."""
+        mock_supabase.set_table_response("entities", [_make_entity(
+            entity_type="conversation_turn",
+            presentation="hidden",
+            state={"role": "user", "content": "Describe this"},
+            created_by="agent",
+        )])
+
+        mock_anthropic = MagicMock()
+        mock_anthropic.messages.create = AsyncMock(
+            return_value=_make_text_response("It's a cat!")
+        )
+
+        context_items = [{
+            "id": "file-1",
+            "name": "photo.png",
+            "type": "image",
+            "data": "data:image/png;base64,iVBORw0KGgo=",
+        }]
+
+        await run_agent(
+            mock_supabase,
+            mock_anthropic,
+            TEST_SPACE_ID,
+            TEST_USER_ID,
+            "Describe this",
+            context_items=context_items,
+        )
+
+        # Check the messages sent to Claude
+        call_args = mock_anthropic.messages.create.call_args
+        messages = call_args.kwargs["messages"]
+        user_content = messages[0]["content"]
+
+        # Should be a list with an image block and a text block
+        assert isinstance(user_content, list)
+        image_blocks = [b for b in user_content if b.get("type") == "image"]
+        assert len(image_blocks) == 1
+        assert image_blocks[0]["source"]["media_type"] == "image/png"
+        assert image_blocks[0]["source"]["data"] == "iVBORw0KGgo="
+
+    @patch("agent.loop.build_system_prompt", new_callable=AsyncMock, return_value="test prompt")
+    async def test_context_items_pdf_becomes_document_block(self, mock_prompt, mock_supabase):
+        """A PDF data URL in context_items becomes a Claude document content block."""
+        mock_supabase.set_table_response("entities", [_make_entity(
+            entity_type="conversation_turn",
+            presentation="hidden",
+            state={"role": "user", "content": "Summarize this"},
+            created_by="agent",
+        )])
+
+        mock_anthropic = MagicMock()
+        mock_anthropic.messages.create = AsyncMock(
+            return_value=_make_text_response("Summary done.")
+        )
+
+        context_items = [{
+            "id": "file-2",
+            "name": "report.pdf",
+            "type": "document",
+            "data": "data:application/pdf;base64,JVBERi0=",
+        }]
+
+        await run_agent(
+            mock_supabase,
+            mock_anthropic,
+            TEST_SPACE_ID,
+            TEST_USER_ID,
+            "Summarize this",
+            context_items=context_items,
+        )
+
+        call_args = mock_anthropic.messages.create.call_args
+        messages = call_args.kwargs["messages"]
+        user_content = messages[0]["content"]
+
+        doc_blocks = [b for b in user_content if b.get("type") == "document"]
+        assert len(doc_blocks) == 1
+        assert doc_blocks[0]["source"]["media_type"] == "application/pdf"
+
+    @patch("agent.loop.build_system_prompt", new_callable=AsyncMock, return_value="test prompt")
+    async def test_context_items_text_decoded_as_text_block(self, mock_prompt, mock_supabase):
+        """A text/plain data URL is decoded and included as a text block."""
+        import base64
+        text_data = base64.b64encode(b"Hello, world!").decode()
+
+        mock_supabase.set_table_response("entities", [_make_entity(
+            entity_type="conversation_turn",
+            presentation="hidden",
+            state={"role": "user", "content": "Read this file"},
+            created_by="agent",
+        )])
+
+        mock_anthropic = MagicMock()
+        mock_anthropic.messages.create = AsyncMock(
+            return_value=_make_text_response("Got it.")
+        )
+
+        context_items = [{
+            "id": "file-3",
+            "name": "notes.txt",
+            "type": "document",
+            "data": f"data:text/plain;base64,{text_data}",
+        }]
+
+        await run_agent(
+            mock_supabase,
+            mock_anthropic,
+            TEST_SPACE_ID,
+            TEST_USER_ID,
+            "Read this file",
+            context_items=context_items,
+        )
+
+        call_args = mock_anthropic.messages.create.call_args
+        messages = call_args.kwargs["messages"]
+        user_content = messages[0]["content"]
+
+        text_blocks = [b for b in user_content if b.get("type") == "text"]
+        # Should have the file text block + the message text block
+        file_text_blocks = [b for b in text_blocks if "notes.txt" in b.get("text", "")]
+        assert len(file_text_blocks) == 1
+        assert "Hello, world!" in file_text_blocks[0]["text"]
+
+    @patch("agent.loop.build_system_prompt", new_callable=AsyncMock, return_value="test prompt")
+    async def test_context_items_none_sends_simple_text(self, mock_prompt, mock_supabase):
+        """When context_items is None, message is sent as simple text (not a list)."""
+        mock_supabase.set_table_response("entities", [_make_entity(
+            entity_type="conversation_turn",
+            presentation="hidden",
+            state={"role": "user", "content": "Hello"},
+            created_by="agent",
+        )])
+
+        mock_anthropic = MagicMock()
+        mock_anthropic.messages.create = AsyncMock(
+            return_value=_make_text_response("Hi!")
+        )
+
+        await run_agent(
+            mock_supabase,
+            mock_anthropic,
+            TEST_SPACE_ID,
+            TEST_USER_ID,
+            "Hello",
+        )
+
+        call_args = mock_anthropic.messages.create.call_args
+        messages = call_args.kwargs["messages"]
+        # Should be simple text, not a list of blocks
+        assert messages[0]["content"] == "Hello"
+
+
+# ---------------------------------------------------------------------------
+# Batch position injection tests
+# ---------------------------------------------------------------------------
+
+
+def _make_multi_tool_response(tool_blocks_data: list[tuple[str, str, dict]]):
+    """Create a mock Anthropic Message with multiple tool_use blocks.
+
+    tool_blocks_data: list of (tool_name, tool_id, tool_input)
+    """
+    blocks = []
+    for name, tid, inp in tool_blocks_data:
+        block = MagicMock()
+        block.type = "tool_use"
+        block.name = name
+        block.id = tid
+        block.input = inp
+        blocks.append(block)
+
+    message = MagicMock()
+    message.content = blocks
+    message.stop_reason = "tool_use"
+    return message
+
+
+class TestBatchPositionInjection:
+    """When multiple create_entity calls arrive without explicit positions,
+    the loop should inject tiled grid positions."""
+
+    @patch("agent.loop.build_system_prompt", new_callable=AsyncMock, return_value="test prompt")
+    @patch("agent.loop.execute_tool", new_callable=AsyncMock, return_value={"id": "e-1", "type": "note"})
+    async def test_single_create_no_injection(self, mock_execute, mock_prompt, mock_supabase):
+        """Single create_entity should NOT trigger batch position injection."""
+        mock_supabase.set_table_response("entities", [_make_entity(
+            entity_type="conversation_turn", presentation="hidden",
+            state={"role": "user", "content": "Create a note"}, created_by="agent",
+        )])
+
+        mock_anthropic = MagicMock()
+        mock_anthropic.messages.create = AsyncMock(side_effect=[
+            _make_tool_response("create_entity", "tool_1", {"type": "note"}),
+            _make_text_response("Done!"),
+        ])
+
+        events = []
+        async def collect(e): events.append(e)
+
+        await run_agent(
+            mock_supabase, mock_anthropic, TEST_SPACE_ID, TEST_USER_ID,
+            "Create a note", on_event=collect,
+        )
+
+        start_events = [e for e in events if e["type"] == "tool_call_start"]
+        assert len(start_events) == 1
+        # Should NOT have position injected (single entity, no batch)
+        assert "position" not in start_events[0]["args"]
+
+    @patch("agent.loop.build_system_prompt", new_callable=AsyncMock, return_value="test prompt")
+    @patch("agent.loop.execute_tool", new_callable=AsyncMock, return_value={"id": "e-1", "type": "image"})
+    async def test_three_creates_get_positions(self, mock_execute, mock_prompt, mock_supabase):
+        """3 create_entity calls → positions injected, all distinct."""
+        mock_supabase.set_table_response("entities", [_make_entity(
+            entity_type="conversation_turn", presentation="hidden",
+            state={"role": "user", "content": "3 images"}, created_by="agent",
+        )])
+
+        mock_anthropic = MagicMock()
+        mock_anthropic.messages.create = AsyncMock(side_effect=[
+            _make_multi_tool_response([
+                ("create_entity", "t1", {"type": "image", "state": {"generation_prompt": "cat"}}),
+                ("create_entity", "t2", {"type": "image", "state": {"generation_prompt": "dog"}}),
+                ("create_entity", "t3", {"type": "image", "state": {"generation_prompt": "bird"}}),
+            ]),
+            _make_text_response("Done!"),
+        ])
+
+        events = []
+        async def collect(e): events.append(e)
+
+        await run_agent(
+            mock_supabase, mock_anthropic, TEST_SPACE_ID, TEST_USER_ID,
+            "Generate 3 images", on_event=collect,
+        )
+
+        start_events = [e for e in events if e["type"] == "tool_call_start"]
+        assert len(start_events) == 3
+        # All should have position injected
+        positions = [e["args"]["position"] for e in start_events]
+        coords = [(p["x"], p["y"]) for p in positions]
+        assert len(set(coords)) == 3  # all distinct
+
+    @patch("agent.loop.build_system_prompt", new_callable=AsyncMock, return_value="test prompt")
+    @patch("agent.loop.execute_tool", new_callable=AsyncMock, return_value={"id": "e-1", "type": "note"})
+    async def test_mixed_tools_no_injection(self, mock_execute, mock_prompt, mock_supabase):
+        """1 create_entity + 1 query_entities → no batch injection (only 1 create)."""
+        mock_supabase.set_table_response("entities", [_make_entity(
+            entity_type="conversation_turn", presentation="hidden",
+            state={"role": "user", "content": "do stuff"}, created_by="agent",
+        )])
+
+        mock_anthropic = MagicMock()
+        mock_anthropic.messages.create = AsyncMock(side_effect=[
+            _make_multi_tool_response([
+                ("create_entity", "t1", {"type": "note"}),
+                ("query_entities", "t2", {"type": "note"}),
+            ]),
+            _make_text_response("Done!"),
+        ])
+
+        events = []
+        async def collect(e): events.append(e)
+
+        await run_agent(
+            mock_supabase, mock_anthropic, TEST_SPACE_ID, TEST_USER_ID,
+            "do stuff", on_event=collect,
+        )
+
+        start_events = [e for e in events if e["type"] == "tool_call_start"]
+        create_starts = [e for e in start_events if e["tool"] == "create_entity"]
+        assert len(create_starts) == 1
+        assert "position" not in create_starts[0]["args"]
+
+    @patch("agent.loop.build_system_prompt", new_callable=AsyncMock, return_value="test prompt")
+    @patch("agent.loop.execute_tool", new_callable=AsyncMock, return_value={"id": "e-1", "type": "image"})
+    async def test_explicit_position_not_overwritten(self, mock_execute, mock_prompt, mock_supabase):
+        """create_entity with explicit position should not be overwritten by batch injection."""
+        mock_supabase.set_table_response("entities", [_make_entity(
+            entity_type="conversation_turn", presentation="hidden",
+            state={"role": "user", "content": "images"}, created_by="agent",
+        )])
+
+        explicit_pos = {"x": 10, "y": 20, "locked": True}
+        mock_anthropic = MagicMock()
+        mock_anthropic.messages.create = AsyncMock(side_effect=[
+            _make_multi_tool_response([
+                ("create_entity", "t1", {"type": "image", "position": explicit_pos}),
+                ("create_entity", "t2", {"type": "image"}),
+                ("create_entity", "t3", {"type": "image"}),
+            ]),
+            _make_text_response("Done!"),
+        ])
+
+        events = []
+        async def collect(e): events.append(e)
+
+        await run_agent(
+            mock_supabase, mock_anthropic, TEST_SPACE_ID, TEST_USER_ID,
+            "images", on_event=collect,
+        )
+
+        start_events = [e for e in events if e["type"] == "tool_call_start"]
+        # First entity has explicit position — should be preserved
+        assert start_events[0]["args"]["position"] == explicit_pos
+        # Other two should have injected positions (distinct from each other)
+        pos1 = start_events[1]["args"]["position"]
+        pos2 = start_events[2]["args"]["position"]
+        assert (pos1["x"], pos1["y"]) != (pos2["x"], pos2["y"])
+
+    @patch("agent.loop.build_system_prompt", new_callable=AsyncMock, return_value="test prompt")
+    @patch("agent.loop.execute_tool", new_callable=AsyncMock, return_value={"id": "e-1", "type": "image"})
+    async def test_tool_call_start_events_include_enriched_args(self, mock_execute, mock_prompt, mock_supabase):
+        """tool_call_start events should include the enriched args with positions."""
+        mock_supabase.set_table_response("entities", [_make_entity(
+            entity_type="conversation_turn", presentation="hidden",
+            state={"role": "user", "content": "2 images"}, created_by="agent",
+        )])
+
+        mock_anthropic = MagicMock()
+        mock_anthropic.messages.create = AsyncMock(side_effect=[
+            _make_multi_tool_response([
+                ("create_entity", "t1", {"type": "image"}),
+                ("create_entity", "t2", {"type": "image"}),
+            ]),
+            _make_text_response("Done!"),
+        ])
+
+        events = []
+        async def collect(e): events.append(e)
+
+        await run_agent(
+            mock_supabase, mock_anthropic, TEST_SPACE_ID, TEST_USER_ID,
+            "2 images", on_event=collect,
+        )
+
+        start_events = [e for e in events if e["type"] == "tool_call_start"]
+        for e in start_events:
+            assert "position" in e["args"]
+            pos = e["args"]["position"]
+            assert "x" in pos and "y" in pos
+
+    @patch("agent.loop.build_system_prompt", new_callable=AsyncMock, return_value="test prompt")
+    @patch("agent.loop.execute_tool", new_callable=AsyncMock, return_value={"id": "e-1", "type": "image"})
+    async def test_execute_tool_receives_enriched_params(self, mock_execute, mock_prompt, mock_supabase):
+        """execute_tool should be called with the position-enriched params."""
+        mock_supabase.set_table_response("entities", [_make_entity(
+            entity_type="conversation_turn", presentation="hidden",
+            state={"role": "user", "content": "2 images"}, created_by="agent",
+        )])
+
+        mock_anthropic = MagicMock()
+        mock_anthropic.messages.create = AsyncMock(side_effect=[
+            _make_multi_tool_response([
+                ("create_entity", "t1", {"type": "image"}),
+                ("create_entity", "t2", {"type": "image"}),
+            ]),
+            _make_text_response("Done!"),
+        ])
+
+        await run_agent(
+            mock_supabase, mock_anthropic, TEST_SPACE_ID, TEST_USER_ID,
+            "2 images",
+        )
+
+        # Both execute_tool calls should have received params with position
+        assert mock_execute.call_count == 2
+        for call in mock_execute.call_args_list:
+            params = call[0][2]  # third positional arg
+            assert "position" in params
+
+
+class TestTimezoneThreading:
+    """run_agent should pass user_timezone through to build_system_prompt."""
+
+    @patch("agent.loop.build_system_prompt", new_callable=AsyncMock, return_value="test prompt")
+    async def test_run_agent_passes_timezone_to_prompt(self, mock_prompt, mock_supabase):
+        """When user_timezone is provided, it should be passed to build_system_prompt."""
+        mock_supabase.set_table_response("entities", [_make_entity(
+            entity_type="conversation_turn",
+            presentation="hidden",
+            state={"role": "user", "content": "Schedule meeting at 7pm"},
+            created_by="agent",
+        )])
+
+        mock_anthropic = MagicMock()
+        mock_anthropic.messages.create = AsyncMock(
+            return_value=_make_text_response("Done!")
+        )
+
+        await run_agent(
+            mock_supabase,
+            mock_anthropic,
+            TEST_SPACE_ID,
+            TEST_USER_ID,
+            "Schedule meeting at 7pm",
+            user_timezone="Europe/Bucharest",
+        )
+
+        # build_system_prompt should have received user_timezone
+        call_kwargs = mock_prompt.call_args.kwargs
+        assert call_kwargs.get("user_timezone") == "Europe/Bucharest"
+
+    @patch("agent.loop.build_system_prompt", new_callable=AsyncMock, return_value="test prompt")
+    async def test_run_agent_omits_timezone_when_none(self, mock_prompt, mock_supabase):
+        """When user_timezone is not provided, it should not be in the call."""
+        mock_supabase.set_table_response("entities", [_make_entity(
+            entity_type="conversation_turn",
+            presentation="hidden",
+            state={"role": "user", "content": "Hello"},
+            created_by="agent",
+        )])
+
+        mock_anthropic = MagicMock()
+        mock_anthropic.messages.create = AsyncMock(
+            return_value=_make_text_response("Hi!")
+        )
+
+        await run_agent(
+            mock_supabase,
+            mock_anthropic,
+            TEST_SPACE_ID,
+            TEST_USER_ID,
+            "Hello",
+        )
+
+        # build_system_prompt should have been called without user_timezone
+        # (or with user_timezone=None)
+        call_kwargs = mock_prompt.call_args.kwargs
+        assert call_kwargs.get("user_timezone") is None
 
 
 class TestLoopLogging:
