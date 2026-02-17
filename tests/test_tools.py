@@ -655,7 +655,7 @@ class TestCreateEntityImageWiring:
     """When type='image' and state.generation_prompt is set, create_entity
     calls generate_image and enriches the entity state."""
 
-    @patch("agent.tools.generate_image", new_callable=AsyncMock)
+    @patch("agent.image_gen.generate_image", new_callable=AsyncMock)
     async def test_image_entity_calls_generate_image(self, mock_gen, mock_supabase, make_entity):
         """create_entity with type='image' + generation_prompt triggers image generation."""
         mock_gen.return_value = {
@@ -684,7 +684,7 @@ class TestCreateEntityImageWiring:
 
         mock_gen.assert_called_once_with("a sunset", TEST_SPACE_ID, mock_supabase)
 
-    @patch("agent.tools.generate_image", new_callable=AsyncMock)
+    @patch("agent.image_gen.generate_image", new_callable=AsyncMock)
     async def test_image_entity_enriches_state(self, mock_gen, mock_supabase, make_entity):
         """State should include image_url, width, height from generate_image result."""
         mock_gen.return_value = {
@@ -724,7 +724,7 @@ class TestCreateEntityImageWiring:
         assert row["state"]["height"] == 768
         assert row["state"]["generation_prompt"] == "a cat"
 
-    @patch("agent.tools.generate_image", new_callable=AsyncMock)
+    @patch("agent.image_gen.generate_image", new_callable=AsyncMock)
     async def test_image_entity_defaults_presentation_to_card(self, mock_gen, mock_supabase, make_entity):
         """Image entities default to presentation='card' (not 'window')."""
         mock_gen.return_value = {
@@ -761,7 +761,7 @@ class TestCreateEntityImageWiring:
         row = insert_called_with["args"][0]
         assert row["presentation"] == "card"
 
-    @patch("agent.tools.generate_image", new_callable=AsyncMock)
+    @patch("agent.image_gen.generate_image", new_callable=AsyncMock)
     async def test_image_entity_defaults_size(self, mock_gen, mock_supabase, make_entity):
         """Image entities default to size 232x300."""
         mock_gen.return_value = {
@@ -798,7 +798,7 @@ class TestCreateEntityImageWiring:
         row = insert_called_with["args"][0]
         assert row["size"] == {"width": 232, "height": 300}
 
-    @patch("agent.tools.generate_image", new_callable=AsyncMock)
+    @patch("agent.image_gen.generate_image", new_callable=AsyncMock)
     async def test_image_entity_failure_sets_generation_error(self, mock_gen, mock_supabase, make_entity):
         """On generate_image failure, entity is still created with generation_error in state."""
         mock_gen.side_effect = RuntimeError("Gemini API failed")
@@ -833,7 +833,7 @@ class TestCreateEntityImageWiring:
         # image_url should NOT be in state on failure
         assert "image_url" not in row["state"]
 
-    @patch("agent.tools.generate_image", new_callable=AsyncMock)
+    @patch("agent.image_gen.generate_image", new_callable=AsyncMock)
     async def test_non_image_entity_does_not_trigger_generation(self, mock_gen, mock_supabase, make_entity):
         """create_entity with type='note' should not call generate_image."""
         expected = make_entity(entity_type="note", created_by="agent")
@@ -846,7 +846,7 @@ class TestCreateEntityImageWiring:
 
         mock_gen.assert_not_called()
 
-    @patch("agent.tools.generate_image", new_callable=AsyncMock)
+    @patch("agent.image_gen.generate_image", new_callable=AsyncMock)
     async def test_image_without_generation_prompt_skips_generation(self, mock_gen, mock_supabase, make_entity):
         """Image entity without generation_prompt should not trigger generation."""
         expected = make_entity(entity_type="image", created_by="agent")

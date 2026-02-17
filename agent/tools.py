@@ -8,7 +8,6 @@ Implementations are async functions that take (client, space_id, user_id, params
 """
 
 from agent.logging import get_logger
-from agent.image_gen import generate_image
 
 logger = get_logger("agent.tools")
 
@@ -188,6 +187,8 @@ async def create_entity(client, space_id: str, user_id: str, params: dict) -> di
     # Image generation: type='image' + generation_prompt triggers Gemini pipeline
     is_image_gen = entity_type == "image" and "generation_prompt" in state
     if is_image_gen:
+        from agent.image_gen import generate_image
+
         try:
             gen_result = await generate_image(
                 state["generation_prompt"], space_id, client
