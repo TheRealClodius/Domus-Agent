@@ -22,6 +22,7 @@ How to run, test, and deploy the agent service. For system-wide architecture, se
 | `uvicorn[standard]` | >=0.40 | ASGI server |
 | `anthropic` | >=0.79 | Claude SDK (agent loop) |
 | `google-genai` | >=1.63 | Image generation (Gemini) |
+| `Pillow` | >=11.0 | Image processing (PNG validation, dimensions) |
 | `httpx` | >=0.28 | Perplexity API calls |
 | `supabase` | >=2.28 | DB client (async via `acreate_client()`) |
 | `networkx` | >=3.6 | Entity graph operations |
@@ -135,7 +136,7 @@ GET /health → { "status": "ok" }
 
 ## Logging
 
-Structured JSON logs. Include `space_id` and `user_id` as correlation fields for tracing agent turns through tool calls.
+Structured JSON logs via `agent/logging.py`. Activated at startup in `main.py` via `setup_logging()`. Modules use `get_logger("agent.<module>")` for named loggers. Include `space_id` and `user_id` as correlation fields for tracing agent turns through tool calls. Tool executions are logged via `log_tool_execution()` with timing data.
 
 ---
 

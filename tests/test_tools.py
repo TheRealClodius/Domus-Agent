@@ -6,7 +6,7 @@ import pytest
 
 from agent.tools import TOOL_DEFINITIONS
 from agent.tools import create_entity, read_entity, query_entities, update_entity, execute_tool
-from tests.conftest import TEST_SPACE_ID, TEST_USER_ID, _make_entity, MockSupabaseClient
+from tests.conftest import TEST_SPACE_ID, TEST_USER_ID, _make_entity, MockSupabaseClient, MockQueryBuilder
 
 
 class TestToolDefinitionsStructure:
@@ -644,3 +644,217 @@ class TestExecuteTool:
         )
 
         assert result == {"error": "unknown_tool", "tool": "nonexistent_tool"}
+
+
+# ---------------------------------------------------------------------------
+# Image generation wiring in create_entity
+# ---------------------------------------------------------------------------
+
+
+class TestCreateEntityImageWiring:
+    """When type='image' and state.generation_prompt is set, create_entity
+    calls generate_image and enriches the entity state."""
+
+    @patch("agent.tools.generate_image", new_callable=AsyncMock)
+    async def test_image_entity_calls_generate_image(self, mock_gen, mock_supabase, make_entity):
+        """create_entity with type='image' + generation_prompt triggers image generation."""
+        mock_gen.return_value = {
+            "storage_path": f"{TEST_SPACE_ID}/abc.png",
+            "public_url": "https://test.supabase.co/storage/v1/object/public/images/abc.png",
+            "width": 1024,
+            "height": 1024,
+        }
+        expected = make_entity(
+            entity_type="image",
+            presentation="card",
+            state={
+                "generation_prompt": "a sunset",
+                "image_url": "https://test.supabase.co/storage/v1/object/public/images/abc.png",
+                "width": 1024,
+                "height": 1024,
+            },
+            created_by="agent",
+        )
+        mock_supabase.set_table_response("entities", [expected])
+
+        result = await create_entity(
+            mock_supabase, TEST_SPACE_ID, TEST_USER_ID,
+            {"type": "image", "state": {"generation_prompt": "a sunset"}},
+        )
+
+        mock_gen.assert_called_once_with("a sunset", TEST_SPACE_ID, mock_supabase)
+
+    @patch("agent.tools.generate_image", new_callable=AsyncMock)
+    async def test_image_entity_enriches_state(self, mock_gen, mock_supabase, make_entity):
+        """State should include image_url, width, height from generate_image result."""
+        mock_gen.return_value = {
+            "storage_path": f"{TEST_SPACE_ID}/abc.png",
+            "public_url": "https://example.com/image.png",
+            "width": 512,
+            "height": 768,
+        }
+
+        insert_called_with = {}
+        original_table = mock_supabase.table
+
+        def table_spy(name):
+            builder = original_table(name)
+            original_insert = builder.insert
+
+            def insert_capture(*args, **kwargs):
+                insert_called_with.update({"args": args})
+                return original_insert(*args, **kwargs)
+
+            builder.insert = insert_capture
+            return builder
+
+        mock_supabase.table = table_spy
+
+        expected = make_entity(entity_type="image", created_by="agent")
+        mock_supabase.set_table_response("entities", [expected])
+
+        await create_entity(
+            mock_supabase, TEST_SPACE_ID, TEST_USER_ID,
+            {"type": "image", "state": {"generation_prompt": "a cat"}},
+        )
+
+        row = insert_called_with["args"][0]
+        assert row["state"]["image_url"] == "https://example.com/image.png"
+        assert row["state"]["width"] == 512
+        assert row["state"]["height"] == 768
+        assert row["state"]["generation_prompt"] == "a cat"
+
+    @patch("agent.tools.generate_image", new_callable=AsyncMock)
+    async def test_image_entity_defaults_presentation_to_card(self, mock_gen, mock_supabase, make_entity):
+        """Image entities default to presentation='card' (not 'window')."""
+        mock_gen.return_value = {
+            "storage_path": f"{TEST_SPACE_ID}/abc.png",
+            "public_url": "https://example.com/image.png",
+            "width": 1024,
+            "height": 1024,
+        }
+
+        insert_called_with = {}
+        original_table = mock_supabase.table
+
+        def table_spy(name):
+            builder = original_table(name)
+            original_insert = builder.insert
+
+            def insert_capture(*args, **kwargs):
+                insert_called_with.update({"args": args})
+                return original_insert(*args, **kwargs)
+
+            builder.insert = insert_capture
+            return builder
+
+        mock_supabase.table = table_spy
+
+        expected = make_entity(entity_type="image", created_by="agent")
+        mock_supabase.set_table_response("entities", [expected])
+
+        await create_entity(
+            mock_supabase, TEST_SPACE_ID, TEST_USER_ID,
+            {"type": "image", "state": {"generation_prompt": "landscape"}},
+        )
+
+        row = insert_called_with["args"][0]
+        assert row["presentation"] == "card"
+
+    @patch("agent.tools.generate_image", new_callable=AsyncMock)
+    async def test_image_entity_defaults_size(self, mock_gen, mock_supabase, make_entity):
+        """Image entities default to size 232x300."""
+        mock_gen.return_value = {
+            "storage_path": f"{TEST_SPACE_ID}/abc.png",
+            "public_url": "https://example.com/image.png",
+            "width": 1024,
+            "height": 1024,
+        }
+
+        insert_called_with = {}
+        original_table = mock_supabase.table
+
+        def table_spy(name):
+            builder = original_table(name)
+            original_insert = builder.insert
+
+            def insert_capture(*args, **kwargs):
+                insert_called_with.update({"args": args})
+                return original_insert(*args, **kwargs)
+
+            builder.insert = insert_capture
+            return builder
+
+        mock_supabase.table = table_spy
+
+        expected = make_entity(entity_type="image", created_by="agent")
+        mock_supabase.set_table_response("entities", [expected])
+
+        await create_entity(
+            mock_supabase, TEST_SPACE_ID, TEST_USER_ID,
+            {"type": "image", "state": {"generation_prompt": "abstract art"}},
+        )
+
+        row = insert_called_with["args"][0]
+        assert row["size"] == {"width": 232, "height": 300}
+
+    @patch("agent.tools.generate_image", new_callable=AsyncMock)
+    async def test_image_entity_failure_sets_generation_error(self, mock_gen, mock_supabase, make_entity):
+        """On generate_image failure, entity is still created with generation_error in state."""
+        mock_gen.side_effect = RuntimeError("Gemini API failed")
+
+        insert_called_with = {}
+        original_table = mock_supabase.table
+
+        def table_spy(name):
+            builder = original_table(name)
+            original_insert = builder.insert
+
+            def insert_capture(*args, **kwargs):
+                insert_called_with.update({"args": args})
+                return original_insert(*args, **kwargs)
+
+            builder.insert = insert_capture
+            return builder
+
+        mock_supabase.table = table_spy
+
+        expected = make_entity(entity_type="image", created_by="agent")
+        mock_supabase.set_table_response("entities", [expected])
+
+        result = await create_entity(
+            mock_supabase, TEST_SPACE_ID, TEST_USER_ID,
+            {"type": "image", "state": {"generation_prompt": "failing prompt"}},
+        )
+
+        row = insert_called_with["args"][0]
+        assert "generation_error" in row["state"]
+        assert "Gemini API failed" in row["state"]["generation_error"]
+        # image_url should NOT be in state on failure
+        assert "image_url" not in row["state"]
+
+    @patch("agent.tools.generate_image", new_callable=AsyncMock)
+    async def test_non_image_entity_does_not_trigger_generation(self, mock_gen, mock_supabase, make_entity):
+        """create_entity with type='note' should not call generate_image."""
+        expected = make_entity(entity_type="note", created_by="agent")
+        mock_supabase.set_table_response("entities", [expected])
+
+        await create_entity(
+            mock_supabase, TEST_SPACE_ID, TEST_USER_ID,
+            {"type": "note", "state": {"title": "Hello"}},
+        )
+
+        mock_gen.assert_not_called()
+
+    @patch("agent.tools.generate_image", new_callable=AsyncMock)
+    async def test_image_without_generation_prompt_skips_generation(self, mock_gen, mock_supabase, make_entity):
+        """Image entity without generation_prompt should not trigger generation."""
+        expected = make_entity(entity_type="image", created_by="agent")
+        mock_supabase.set_table_response("entities", [expected])
+
+        await create_entity(
+            mock_supabase, TEST_SPACE_ID, TEST_USER_ID,
+            {"type": "image", "state": {"image_url": "https://existing.com/img.png"}},
+        )
+
+        mock_gen.assert_not_called()

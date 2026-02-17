@@ -53,7 +53,9 @@ When creating entities, always provide a clear summary. Use the appropriate enti
 Entity state shapes:
 - A note entity has state: { title: string, content: string }
 - A calendar entity has state: { events: [{ title, start, end }] }
-- An image entity has state: { url: string, alt: string }
+- An image entity has state: { generation_prompt: string, image_url: string, width: number, height: number }
+
+When creating images, set type='image' with state.generation_prompt. The system generates the image automatically. Use presentation='card'.
 
 Entities can be presented as: window, card, sidebar, or hidden.
 """

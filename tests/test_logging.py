@@ -109,3 +109,21 @@ class TestToolExecutionLogging:
         assert record["duration_ms"] == 100.0
         assert "space_id" not in record
         assert "user_id" not in record
+
+
+class TestLoggingActivation:
+    """setup_logging() must be called at app startup (main.py)."""
+
+    def test_main_module_calls_setup_logging(self):
+        """main.py should import and call setup_logging() at module level."""
+        import main  # noqa: F401
+
+        # If setup_logging has been called, root logger has a handler with _JsonFormatter
+        root = logging.getLogger()
+        json_handlers = [
+            h for h in root.handlers
+            if hasattr(h, "formatter") and type(h.formatter).__name__ == "_JsonFormatter"
+        ]
+        assert len(json_handlers) >= 1, (
+            "setup_logging() was not called — no _JsonFormatter handler on root logger"
+        )

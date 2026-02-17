@@ -238,3 +238,23 @@ class TestBuildSystemPrompt:
         assert "A note entity has state:" in prompt
         assert "A calendar entity has state:" in prompt
         assert "An image entity has state:" in prompt
+
+    async def test_image_state_shape_includes_generation_prompt(self, mock_supabase):
+        """Image entity state shape should reference generation_prompt, image_url, width, height."""
+        mock_supabase.set_table_response("entities", [])
+
+        prompt = await build_system_prompt(mock_supabase, TEST_SPACE_ID, "hello")
+
+        assert "generation_prompt" in prompt
+        assert "image_url" in prompt
+        # Should NOT reference the old url/alt shape
+        assert "{ url: string, alt: string }" not in prompt
+
+    async def test_system_prompt_includes_image_creation_guidance(self, mock_supabase):
+        """Prompt should instruct agent to use type='image' with generation_prompt and presentation='card'."""
+        mock_supabase.set_table_response("entities", [])
+
+        prompt = await build_system_prompt(mock_supabase, TEST_SPACE_ID, "hello")
+
+        assert "generation_prompt" in prompt
+        assert "presentation" in prompt.lower() or "card" in prompt

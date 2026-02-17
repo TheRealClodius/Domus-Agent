@@ -1,6 +1,7 @@
 """Tests for agent/loop.py — conversation turn persistence and agent loop."""
 
 import json
+import logging
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -500,3 +501,49 @@ class TestMultiTurnAgent:
         assert roles == ["user", "assistant"]
         assert turn_inserts[0]["state"]["content"] == "Create a note"
         assert turn_inserts[1]["state"]["content"] == "Done!"
+
+
+# ---------------------------------------------------------------------------
+# Logging in loop.py
+# ---------------------------------------------------------------------------
+
+
+class TestLoopLogging:
+    """loop.py should use structured logging for key events."""
+
+    @patch("agent.loop.build_system_prompt", new_callable=AsyncMock, return_value="test prompt")
+    async def test_agent_turn_logged(self, mock_prompt, mock_supabase, capfd):
+        """run_agent should log the start of an agent turn."""
+        from agent.logging import setup_logging
+
+        setup_logging()
+
+        mock_supabase.set_table_response("entities", [_make_entity(
+            entity_type="conversation_turn",
+            presentation="hidden",
+            state={"role": "user", "content": "Hi"},
+            created_by="agent",
+        )])
+
+        mock_anthropic = MagicMock()
+        mock_anthropic.messages.create = AsyncMock(
+            return_value=_make_text_response("Hello!")
+        )
+
+        await run_agent(
+            mock_supabase,
+            mock_anthropic,
+            TEST_SPACE_ID,
+            TEST_USER_ID,
+            "Hi",
+        )
+
+        captured = capfd.readouterr()
+        log_lines = [
+            json.loads(line)
+            for line in captured.err.strip().split("\n")
+            if line.strip()
+        ]
+        # Should have at least one log line from the agent loop
+        agent_logs = [l for l in log_lines if l.get("logger", "").startswith("agent.")]
+        assert len(agent_logs) >= 1, f"Expected agent.* log lines, got: {log_lines}"

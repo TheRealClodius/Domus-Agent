@@ -9,7 +9,10 @@ from pydantic import BaseModel
 
 import config
 from config import acreate_client, create_anthropic_client
+from agent.logging import setup_logging
 from agent.loop import run_agent, format_sse_event
+
+setup_logging()
 
 app = FastAPI(title="Domus Agent")
 

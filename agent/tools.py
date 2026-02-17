@@ -7,6 +7,11 @@ Definitions live in TOOL_DEFINITIONS (list of dicts for Claude's tools parameter
 Implementations are async functions that take (client, space_id, user_id, params).
 """
 
+from agent.logging import get_logger
+from agent.image_gen import generate_image
+
+logger = get_logger("agent.tools")
+
 TOOL_DEFINITIONS = [
     {
         "name": "create_entity",
@@ -172,16 +177,48 @@ TOOL_DEFINITIONS = [
 
 
 async def create_entity(client, space_id: str, user_id: str, params: dict) -> dict:
-    """Insert a new entity. Always sets created_by='agent'."""
+    """Insert a new entity. Always sets created_by='agent'.
+
+    For image entities with state.generation_prompt, automatically generates
+    the image via Gemini and enriches the state with image_url, width, height.
+    """
+    entity_type = params["type"]
+    state = dict(params.get("state", {}))
+
+    # Image generation: type='image' + generation_prompt triggers Gemini pipeline
+    is_image_gen = entity_type == "image" and "generation_prompt" in state
+    if is_image_gen:
+        try:
+            gen_result = await generate_image(
+                state["generation_prompt"], space_id, client
+            )
+            state["image_url"] = gen_result["public_url"]
+            state["width"] = gen_result["width"]
+            state["height"] = gen_result["height"]
+        except Exception as e:
+            logger.warning(
+                "image_generation_failed",
+                extra={"space_id": space_id, "error": str(e)},
+            )
+            state["generation_error"] = str(e)
+
+    # Image-specific defaults
+    if entity_type == "image":
+        default_presentation = "card"
+        default_size = {"width": 232, "height": 300}
+    else:
+        default_presentation = "window"
+        default_size = {"width": 600, "height": 400}
+
     row = {
         "space_id": space_id,
         "user_id": user_id,
-        "type": params["type"],
+        "type": entity_type,
         "content": params.get("content"),
-        "presentation": params.get("presentation", "window"),
+        "presentation": params.get("presentation", default_presentation),
         "position": params.get("position", {"x": 50, "y": 50, "locked": False}),
-        "size": params.get("size", {"width": 600, "height": 400}),
-        "state": params.get("state", {}),
+        "size": params.get("size", default_size),
+        "state": state,
         "summary": params.get("summary"),
         "created_by": "agent",
     }

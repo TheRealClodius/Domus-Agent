@@ -25,6 +25,7 @@ agent/
   context.py       — Lightweight system prompt (entity index, schemas, personality, recent turns)
   tools.py         — 5 tools: create_entity, update_entity, query_entities, read_entity, web_search
   image_gen.py     — Gemini image generation (google-genai SDK, PIL, Supabase Storage)
+  logging.py       — Structured JSON logging (setup_logging, get_logger, log_tool_execution)
   memory.py        — Compaction: Opus summarizes old turns, extracts facts + edges
   prompts/
     builder.py     — Composed app builder prompt, injected by context.py on detection

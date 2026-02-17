@@ -5,6 +5,7 @@ fastapi>=0.129
 uvicorn[standard]>=0.40
 anthropic>=0.79
 google-genai>=1.63
+Pillow>=11.0
 httpx>=0.28
 supabase>=2.28
 networkx>=3.6

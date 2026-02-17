@@ -69,27 +69,43 @@ If you're tempted to add a sixth tool, you're doing something wrong.
 
 ## Image Generation (`agent/image_gen.py`)
 
-Uses Gemini, called as a backend service from `tools.py`. Not part of the agent loop.
+Uses Gemini, called automatically from `create_entity` in `tools.py` when `type='image'` and `state.generation_prompt` is present. Not part of the agent loop directly.
 
-**Model:** `gemini-2.5-flash-image` (GA, $0.039/image, 1024x1024 max)
+**Model:** `gemini-2.0-flash-exp` (image generation mode via `response_modalities=["IMAGE"]`)
 **SDK:** `google-genai` (`client.models.generate_content()`)
+**Dependencies:** `google-genai`, `Pillow` (PIL)
 
-**Three intents** (Claude decides from conversation context):
-
-| Intent | Trigger | Gemini call |
-|--------|---------|-------------|
-| Generate | `create_entity(type='image', state={ generation_prompt })` | `generate_content([prompt])` — text only |
-| Edit | `update_entity(id, state={ edit_prompt })` | `generate_content([edit_prompt, current_image])` — text + image |
-| Inspire | `create_entity(type='image', state={ generation_prompt, reference_entity_ids })` | `generate_content([prompt, ref_images...])` — text + reference images |
+**Trigger:** `create_entity(type='image', state={ generation_prompt: "..." })` — `tools.py` detects the combination and calls `generate_image()` before inserting the entity.
 
 **Pipeline (all in-memory):**
 ```
-Supabase Storage → download bytes → BytesIO → PIL Image.open()
-  → Gemini generate_content → response.parts[0].as_image()
-  → PIL Image → BytesIO → Supabase Storage upload → store URL in entity state
+Prompt → Gemini generate_content(response_modalities=["IMAGE"])
+  → response.candidates[0].content.parts[0].inline_data.data
+  → PIL Image.open(BytesIO(bytes)) → get width/height → save as PNG
+  → Supabase Storage upload to images/{space_id}/{uuid}.png
+  → public_url stored in entity state
 ```
 
-Claude manages multi-turn editing context. After ~5 edits (cumulative quality degradation), Claude regenerates from scratch with a comprehensive prompt.
+**Entity state after generation:**
+```json
+{
+  "generation_prompt": "a serene sunset over mountains",
+  "image_url": "https://....supabase.co/storage/v1/object/public/images/space-id/uuid.png",
+  "width": 1024,
+  "height": 1024
+}
+```
+
+**Defaults for image entities:** `presentation: "card"`, `size: { width: 232, height: 300 }`
+
+**Error handling:** If Gemini fails, the entity is still created with `state.generation_error` instead of `image_url`. The frontend can display an error state.
+
+**Future intents** (not yet implemented):
+
+| Intent | Trigger | Gemini call |
+|--------|---------|-------------|
+| Edit | `update_entity(id, state={ edit_prompt })` | `generate_content([edit_prompt, current_image])` — text + image |
+| Inspire | `create_entity(type='image', state={ generation_prompt, reference_entity_ids })` | `generate_content([prompt, ref_images...])` — text + reference images |
 
 ---
 

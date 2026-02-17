@@ -2,9 +2,13 @@
 
 import asyncio
 import json
+import time
 
+from agent.logging import get_logger, log_tool_execution
 from agent.tools import TOOL_DEFINITIONS, execute_tool
 from agent.context import build_system_prompt
+
+logger = get_logger("agent.loop")
 
 
 async def save_conversation_turn(
@@ -68,6 +72,11 @@ async def run_agent(
         async def on_event(event):
             pass
 
+    logger.info(
+        "agent_turn_start",
+        extra={"space_id": space_id, "user_id": user_id},
+    )
+
     # Build system prompt
     system = await build_system_prompt(client, space_id, message)
 
@@ -116,12 +125,19 @@ async def run_agent(
                 break
 
             # Execute tool calls in parallel
+            t0 = time.monotonic()
             results = await asyncio.gather(
                 *[
                     execute_tool(client, tc.name, tc.input, space_id, user_id)
                     for tc in tool_use_blocks
                 ]
             )
+            elapsed_ms = (time.monotonic() - t0) * 1000
+            for tc in tool_use_blocks:
+                log_tool_execution(
+                    logger, tc.name, elapsed_ms,
+                    space_id=space_id, user_id=user_id,
+                )
 
             # Stream tool results
             for tc, result in zip(tool_use_blocks, results):
