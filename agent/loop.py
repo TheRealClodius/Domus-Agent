@@ -207,19 +207,19 @@ async def run_agent(
                 })
 
             # Execute tool calls in parallel
-            t0 = time.monotonic()
+            async def _timed_execute(tc, params):
+                t = time.monotonic()
+                result = await execute_tool(client, tc.name, params, space_id, user_id)
+                ms = (time.monotonic() - t) * 1000
+                log_tool_execution(logger, tc.name, ms, space_id=space_id, user_id=user_id)
+                return result
+
             results = await asyncio.gather(
                 *[
-                    execute_tool(client, tc.name, params, space_id, user_id)
+                    _timed_execute(tc, params)
                     for tc, params in zip(tool_use_blocks, params_list)
                 ]
             )
-            elapsed_ms = (time.monotonic() - t0) * 1000
-            for tc in tool_use_blocks:
-                log_tool_execution(
-                    logger, tc.name, elapsed_ms,
-                    space_id=space_id, user_id=user_id,
-                )
 
             # Stream tool results
             for tc, result in zip(tool_use_blocks, results):

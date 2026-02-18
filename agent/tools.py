@@ -167,6 +167,52 @@ TOOL_DEFINITIONS = [
             "required": ["id"],
         },
     },
+    # SPIKE: entity-as-mcp — discover what tools an entity supports
+    {
+        "name": "get_entity_schema",
+        "description": (
+            "Discover what actions an app entity supports. Returns a list of "
+            "MCP tool schemas describing available operations and their parameters. "
+            "Use this before call_entity_tool to know what you can do."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "entity_id": {
+                    "type": "string",
+                    "description": "The entity ID to get the schema for",
+                },
+            },
+            "required": ["entity_id"],
+        },
+    },
+    # SPIKE: entity-as-mcp — call a structured tool on an entity
+    {
+        "name": "call_entity_tool",
+        "description": (
+            "Execute a structured action on an app entity. The tool_name must be "
+            "one returned by get_entity_schema. Returns the new state, summary, "
+            "and updated schema (tools may change based on new state)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "entity_id": {
+                    "type": "string",
+                    "description": "The entity ID to call the tool on",
+                },
+                "tool_name": {
+                    "type": "string",
+                    "description": "Name of the tool to call (from get_entity_schema)",
+                },
+                "params": {
+                    "type": "object",
+                    "description": "Parameters for the tool call",
+                },
+            },
+            "required": ["entity_id", "tool_name"],
+        },
+    },
 ]
 
 
@@ -223,7 +269,21 @@ async def create_entity(client, space_id: str, user_id: str, params: dict) -> di
         "summary": params.get("summary"),
         "created_by": "agent",
     }
-    result = await client.table("entities").insert(row).execute()
+    try:
+        result = await client.table("entities").insert(row).execute()
+    except Exception as e:
+        logger.error(
+            "create_entity_insert_failed",
+            extra={
+                "space_id": space_id,
+                "entity_type": entity_type,
+                "error": str(e)[:500],
+                "row_keys": list(row.keys()),
+                "presentation": row.get("presentation"),
+                "state_keys": list(state.keys()) if isinstance(state, dict) else str(type(state)),
+            },
+        )
+        raise
     return result.data[0] if result.data else row
 
 
@@ -338,6 +398,56 @@ def _merge_patch(target: dict, patch: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# SPIKE: entity-as-mcp — schema discovery and structured tool calls
+# ---------------------------------------------------------------------------
+
+
+async def get_entity_schema(client, space_id: str, user_id: str, params: dict) -> dict:
+    """Fetch MCP tool schemas for an entity from the frontend."""
+    import httpx
+    from config import DOMUS_FRONTEND_URL, DOMUS_SERVICE_TOKEN
+
+    entity_id = params["entity_id"]
+    url = f"{DOMUS_FRONTEND_URL}/api/entities/{entity_id}/schema"
+
+    async with httpx.AsyncClient() as http:
+        resp = await http.get(
+            url,
+            params={"space_id": space_id},
+            headers={"Authorization": f"Bearer {DOMUS_SERVICE_TOKEN}"},
+            timeout=10.0,
+        )
+
+    if resp.status_code != 200:
+        return {"error": "schema_fetch_failed", "status": resp.status_code, "body": resp.text}
+    return resp.json()
+
+
+async def call_entity_tool(client, space_id: str, user_id: str, params: dict) -> dict:
+    """Execute a structured tool on an entity via the frontend."""
+    import httpx
+    from config import DOMUS_FRONTEND_URL, DOMUS_SERVICE_TOKEN
+
+    entity_id = params["entity_id"]
+    tool_name = params["tool_name"]
+    tool_params = params.get("params", {})
+    url = f"{DOMUS_FRONTEND_URL}/api/entities/{entity_id}/call"
+
+    async with httpx.AsyncClient() as http:
+        resp = await http.post(
+            url,
+            params={"space_id": space_id},
+            headers={"Authorization": f"Bearer {DOMUS_SERVICE_TOKEN}"},
+            json={"tool_name": tool_name, "params": tool_params},
+            timeout=10.0,
+        )
+
+    if resp.status_code != 200:
+        return {"error": "tool_call_failed", "status": resp.status_code, "body": resp.text}
+    return resp.json()
+
+
+# ---------------------------------------------------------------------------
 # Batch positioning
 # ---------------------------------------------------------------------------
 
@@ -396,6 +506,9 @@ async def execute_tool(client, name: str, params: dict, space_id: str, user_id: 
         "read_entity": read_entity,
         "query_entities": query_entities,
         "update_entity": update_entity,
+        # SPIKE: entity-as-mcp
+        "get_entity_schema": get_entity_schema,
+        "call_entity_tool": call_entity_tool,
     }
     fn = tools.get(name)
     if fn is None:

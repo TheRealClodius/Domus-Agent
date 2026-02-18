@@ -25,7 +25,11 @@ class TestToolDefinitionsStructure:
 
     def test_tool_names_match_exactly(self):
         names = [defn["name"] for defn in TOOL_DEFINITIONS]
-        expected = ["create_entity", "update_entity", "query_entities", "read_entity"]
+        expected = [
+            "create_entity", "update_entity", "query_entities", "read_entity",
+            # SPIKE: entity-as-mcp
+            "get_entity_schema", "call_entity_tool",
+        ]
         assert names == expected
 
     def test_each_input_schema_is_object_with_properties(self):
@@ -979,3 +983,210 @@ class TestCheckBatchImageQuota:
         result = await check_batch_image_quota(None, "user-456", 1)
         assert isinstance(result, tuple)
         assert len(result) == 2
+
+
+# ---------------------------------------------------------------------------
+# SPIKE: entity-as-mcp — tool definition and handler tests
+# ---------------------------------------------------------------------------
+
+
+from agent.tools import get_entity_schema, call_entity_tool
+
+
+class TestGetEntitySchemaDefinition:
+    """get_entity_schema tool definition."""
+
+    def _get_defn(self):
+        return next(d for d in TOOL_DEFINITIONS if d["name"] == "get_entity_schema")
+
+    def test_requires_entity_id(self):
+        defn = self._get_defn()
+        assert defn["input_schema"]["required"] == ["entity_id"]
+
+    def test_has_expected_properties(self):
+        defn = self._get_defn()
+        props = defn["input_schema"]["properties"]
+        assert set(props.keys()) == {"entity_id"}
+
+    def test_has_description(self):
+        defn = self._get_defn()
+        assert "discover" in defn["description"].lower() or "schema" in defn["description"].lower()
+
+
+class TestCallEntityToolDefinition:
+    """call_entity_tool tool definition."""
+
+    def _get_defn(self):
+        return next(d for d in TOOL_DEFINITIONS if d["name"] == "call_entity_tool")
+
+    def test_requires_entity_id_and_tool_name(self):
+        defn = self._get_defn()
+        assert set(defn["input_schema"]["required"]) == {"entity_id", "tool_name"}
+
+    def test_has_expected_properties(self):
+        defn = self._get_defn()
+        props = defn["input_schema"]["properties"]
+        assert set(props.keys()) == {"entity_id", "tool_name", "params"}
+
+    def test_params_is_optional(self):
+        defn = self._get_defn()
+        assert "params" not in defn["input_schema"]["required"]
+
+
+class TestGetEntitySchemaHandler:
+    """get_entity_schema handler calls frontend HTTP endpoint."""
+
+    @patch("httpx.AsyncClient")
+    async def test_calls_correct_url_with_auth(self, MockClient):
+        """Handler GETs /api/entities/{id}/schema with Bearer token and space_id."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "entity_id": "ent-1",
+            "type": "calendar",
+            "tools": [{"name": "set_view"}],
+        }
+
+        mock_http = AsyncMock()
+        mock_http.get.return_value = mock_resp
+        mock_http.__aenter__ = AsyncMock(return_value=mock_http)
+        mock_http.__aexit__ = AsyncMock(return_value=False)
+        MockClient.return_value = mock_http
+
+        with patch("config.DOMUS_FRONTEND_URL", "http://test:3000"), \
+             patch("config.DOMUS_SERVICE_TOKEN", "tok-123"):
+            result = await get_entity_schema(None, TEST_SPACE_ID, TEST_USER_ID, {"entity_id": "ent-1"})
+
+        mock_http.get.assert_called_once()
+        call_args = mock_http.get.call_args
+        assert "/api/entities/ent-1/schema" in call_args[0][0]
+        assert call_args[1]["params"] == {"space_id": TEST_SPACE_ID}
+        assert call_args[1]["headers"]["Authorization"] == "Bearer tok-123"
+        assert result["entity_id"] == "ent-1"
+
+    @patch("httpx.AsyncClient")
+    async def test_returns_error_on_non_200(self, MockClient):
+        """Non-200 responses produce an error dict."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 422
+        mock_resp.text = '{"error":"no_schema"}'
+
+        mock_http = AsyncMock()
+        mock_http.get.return_value = mock_resp
+        mock_http.__aenter__ = AsyncMock(return_value=mock_http)
+        mock_http.__aexit__ = AsyncMock(return_value=False)
+        MockClient.return_value = mock_http
+
+        with patch("config.DOMUS_FRONTEND_URL", "http://test:3000"), \
+             patch("config.DOMUS_SERVICE_TOKEN", "tok-123"):
+            result = await get_entity_schema(None, TEST_SPACE_ID, TEST_USER_ID, {"entity_id": "ent-1"})
+
+        assert result["error"] == "schema_fetch_failed"
+        assert result["status"] == 422
+
+
+class TestCallEntityToolHandler:
+    """call_entity_tool handler calls frontend HTTP endpoint."""
+
+    @patch("httpx.AsyncClient")
+    async def test_calls_correct_url_with_auth_and_body(self, MockClient):
+        """Handler POSTs /api/entities/{id}/call with Bearer token, space_id, and body."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "ok": True,
+            "result": {"view": "week"},
+            "summary": "Calendar — week",
+            "schema": [],
+        }
+
+        mock_http = AsyncMock()
+        mock_http.post.return_value = mock_resp
+        mock_http.__aenter__ = AsyncMock(return_value=mock_http)
+        mock_http.__aexit__ = AsyncMock(return_value=False)
+        MockClient.return_value = mock_http
+
+        with patch("config.DOMUS_FRONTEND_URL", "http://test:3000"), \
+             patch("config.DOMUS_SERVICE_TOKEN", "tok-123"):
+            result = await call_entity_tool(
+                None, TEST_SPACE_ID, TEST_USER_ID,
+                {"entity_id": "ent-1", "tool_name": "set_view", "params": {"view": "week"}},
+            )
+
+        mock_http.post.assert_called_once()
+        call_args = mock_http.post.call_args
+        assert "/api/entities/ent-1/call" in call_args[0][0]
+        assert call_args[1]["params"] == {"space_id": TEST_SPACE_ID}
+        assert call_args[1]["json"] == {"tool_name": "set_view", "params": {"view": "week"}}
+        assert result["ok"] is True
+
+    @patch("httpx.AsyncClient")
+    async def test_returns_error_on_non_200(self, MockClient):
+        """Non-200 responses produce an error dict."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 404
+        mock_resp.text = '{"error":"not_found"}'
+
+        mock_http = AsyncMock()
+        mock_http.post.return_value = mock_resp
+        mock_http.__aenter__ = AsyncMock(return_value=mock_http)
+        mock_http.__aexit__ = AsyncMock(return_value=False)
+        MockClient.return_value = mock_http
+
+        with patch("config.DOMUS_FRONTEND_URL", "http://test:3000"), \
+             patch("config.DOMUS_SERVICE_TOKEN", "tok-123"):
+            result = await call_entity_tool(
+                None, TEST_SPACE_ID, TEST_USER_ID,
+                {"entity_id": "ent-1", "tool_name": "set_view", "params": {}},
+            )
+
+        assert result["error"] == "tool_call_failed"
+        assert result["status"] == 404
+
+    @patch("httpx.AsyncClient")
+    async def test_defaults_params_to_empty_dict(self, MockClient):
+        """When params not provided, sends empty dict."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"ok": True}
+
+        mock_http = AsyncMock()
+        mock_http.post.return_value = mock_resp
+        mock_http.__aenter__ = AsyncMock(return_value=mock_http)
+        mock_http.__aexit__ = AsyncMock(return_value=False)
+        MockClient.return_value = mock_http
+
+        with patch("config.DOMUS_FRONTEND_URL", "http://test:3000"), \
+             patch("config.DOMUS_SERVICE_TOKEN", "tok-123"):
+            await call_entity_tool(
+                None, TEST_SPACE_ID, TEST_USER_ID,
+                {"entity_id": "ent-1", "tool_name": "toggle_play"},
+            )
+
+        call_args = mock_http.post.call_args
+        assert call_args[1]["json"]["params"] == {}
+
+
+class TestExecuteToolDispatchesNewTools:
+    """execute_tool dispatches to new entity-as-mcp handlers."""
+
+    @patch("agent.tools.get_entity_schema", new_callable=AsyncMock)
+    async def test_dispatch_get_entity_schema(self, mock_fn):
+        mock_fn.return_value = {"entity_id": "ent-1", "tools": []}
+        result = await execute_tool(
+            None, "get_entity_schema", {"entity_id": "ent-1"},
+            TEST_SPACE_ID, TEST_USER_ID,
+        )
+        mock_fn.assert_called_once_with(None, TEST_SPACE_ID, TEST_USER_ID, {"entity_id": "ent-1"})
+        assert result["entity_id"] == "ent-1"
+
+    @patch("agent.tools.call_entity_tool", new_callable=AsyncMock)
+    async def test_dispatch_call_entity_tool(self, mock_fn):
+        mock_fn.return_value = {"ok": True}
+        result = await execute_tool(
+            None, "call_entity_tool",
+            {"entity_id": "ent-1", "tool_name": "set_view", "params": {"view": "week"}},
+            TEST_SPACE_ID, TEST_USER_ID,
+        )
+        mock_fn.assert_called_once()
+        assert result["ok"] is True

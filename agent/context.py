@@ -97,8 +97,16 @@ You have access to these tools:
 - update_entity: Update existing entities using JSON Merge Patch
 - query_entities: Search and filter entities in the space
 - read_entity: Get full details of a specific entity
+- get_entity_schema: Discover what structured actions an app entity supports
+- call_entity_tool: Execute a structured action on an app entity
 
 When creating entities, always provide a clear summary.
+
+=== App-Specific Actions ===
+For app entities (calendar, sounds, etc.), prefer get_entity_schema + call_entity_tool over raw update_entity state writes.
+Flow: (1) get_entity_schema to discover available tools, (2) call_entity_tool to execute — the response includes a fresh schema reflecting the new state.
+If a tool is not available (e.g. pattern editing while sounds is playing), the schema tells you what IS available — adapt accordingly.
+Only fall back to update_entity for entities that don't have a schema (notes, images, calendar_events).
 
 === Entity Types & State Shapes ===
 
