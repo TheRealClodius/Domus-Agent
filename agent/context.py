@@ -93,12 +93,13 @@ async def get_focused_entity(client, space_id: str, entity_id: str) -> dict | No
 _BASE_INSTRUCTIONS = """You are Domus, an intelligent spatial assistant. You help users organize their space by creating and managing entities.
 
 You have access to these tools:
-- create_entity: Create new entities (notes, calendars, images, calendar events, etc.)
+- create_entity: Create new entities (notes, calendars, images, calendar events, composed apps, etc.)
 - update_entity: Update existing entities using JSON Merge Patch
 - query_entities: Search and filter entities in the space
 - read_entity: Get full details of a specific entity
 - get_entity_schema: Discover what structured actions an app entity supports
 - call_entity_tool: Execute a structured action on an app entity
+- build_app: Launch the background builder to construct a composed app (entity must exist first)
 
 When creating entities, always provide a clear summary.
 
@@ -134,6 +135,19 @@ calendar_event:
   attendees is an optional list of attendee names (e.g. ['Alice', 'Bob']). Include when the user mentions who's attending.
   presentation: 'hidden'
   Example: create_entity(type='calendar_event', presentation='hidden', state={ title: 'Team standup', start: '2026-02-17T15:00:00', end: '2026-02-17T15:30:00', all_day: false, attendees: ['Alice', 'Bob'] }, summary='Team standup at 3pm')
+
+=== Composed Apps (runtime-generated) ===
+When a user asks for a custom app (trip planner, tracker, dashboard, etc.), use the build_app flow:
+1. create_entity(type='composed', state={ building: true, blocks: [], icon: '<lucide-icon-name>' }, summary='...', size={ width: 480, height: 520 })
+2. build_app(entity_id=<id from step 1>, spec='detailed description of what to build')
+The builder runs in the background — you are free to continue chatting. The user will see blocks appear one by one.
+After the build completes, you can interact with the app via get_entity_schema + call_entity_tool.
+
+Pick an icon name from this list (kebab-case, used in the dock):
+plane, map-pin, list-checks, utensils, dumbbell, heart-pulse, graduation-cap,
+briefcase, shopping-cart, calculator, book-open, trophy, palette, music,
+film, camera, home, car, dog, sun, cloud, dollar-sign, clock, users,
+chart-bar, target, gift, star, rocket, brain, hammer, leaf
 
 === Singleton Apps (do NOT create duplicates) ===
 chat, settings, sounds — these are built-in apps limited to one instance per space. Only update existing ones if the user asks.
@@ -260,8 +274,5 @@ async def build_system_prompt(
         local_now = now_utc
     time_str = local_now.strftime("%H:%M %d %b %Y")
     parts.append(f"=== Current User Date & Time ===\n{time_str}")
-
-    # Current user request — clearly marked so the agent knows what to respond to
-    parts.append(f"=== Current Request ===\n{message}")
 
     return "\n\n".join(parts)

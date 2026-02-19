@@ -444,29 +444,16 @@ class TestBuildSystemPrompt:
 
         assert "Current User Date & Time" in prompt
 
-    async def test_system_prompt_contains_current_request(self, mock_supabase):
-        """The user's current message should be clearly labeled in the prompt."""
+    async def test_system_prompt_does_not_duplicate_user_message(self, mock_supabase):
+        """The user's message should NOT appear in the system prompt — it arrives via the messages array."""
         mock_supabase.set_table_response("entities", [])
 
         prompt = await build_system_prompt(
             mock_supabase, TEST_SPACE_ID, "edit this note please"
         )
 
-        assert "=== Current Request ===" in prompt
-        assert "edit this note please" in prompt
-
-    async def test_current_request_is_last_section(self, mock_supabase):
-        """Current request should be the final section in the prompt."""
-        mock_supabase.set_table_response("entities", [])
-
-        prompt = await build_system_prompt(
-            mock_supabase, TEST_SPACE_ID, "schedule meeting for tomorrow"
-        )
-
-        # Current request should come after temporal context
-        date_pos = prompt.index("Current User Date & Time")
-        request_pos = prompt.index("Current Request")
-        assert request_pos > date_pos
+        assert "Current Request" not in prompt
+        assert "edit this note please" not in prompt
 
     async def test_system_prompt_contains_space_name(self, mock_supabase):
         """When space has a name, prompt includes it."""

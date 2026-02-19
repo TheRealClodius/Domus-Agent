@@ -167,7 +167,6 @@ TOOL_DEFINITIONS = [
             "required": ["id"],
         },
     },
-    # SPIKE: entity-as-mcp — discover what tools an entity supports
     {
         "name": "get_entity_schema",
         "description": (
@@ -186,7 +185,6 @@ TOOL_DEFINITIONS = [
             "required": ["entity_id"],
         },
     },
-    # SPIKE: entity-as-mcp — call a structured tool on an entity
     {
         "name": "call_entity_tool",
         "description": (
@@ -211,6 +209,32 @@ TOOL_DEFINITIONS = [
                 },
             },
             "required": ["entity_id", "tool_name"],
+        },
+    },
+    {
+        "name": "build_app",
+        "description": (
+            "Launch the app builder to construct a composed app. "
+            "The entity must already exist (use create_entity first with "
+            "type='composed', state={ building: true, blocks: [] }). "
+            "The builder runs in the background — you are free to continue."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "entity_id": {
+                    "type": "string",
+                    "description": "The entity to build into (must already exist)",
+                },
+                "spec": {
+                    "type": "string",
+                    "description": (
+                        "Natural language description of what to build. "
+                        "Be specific about content, structure, and purpose."
+                    ),
+                },
+            },
+            "required": ["entity_id", "spec"],
         },
     },
 ]
@@ -261,7 +285,7 @@ async def create_entity(client, space_id: str, user_id: str, params: dict) -> di
         "space_id": space_id,
         "user_id": user_id,
         "type": entity_type,
-        "content": params.get("content"),
+        "content": params.get("content") or "",
         "presentation": params.get("presentation", default_presentation),
         "position": params.get("position", {"x": 50, "y": 50, "locked": False}),
         "size": params.get("size", default_size),
@@ -398,7 +422,7 @@ def _merge_patch(target: dict, patch: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# SPIKE: entity-as-mcp — schema discovery and structured tool calls
+# Schema discovery and structured tool calls via frontend API
 # ---------------------------------------------------------------------------
 
 
@@ -495,6 +519,49 @@ async def check_batch_image_quota(
 
 
 # ---------------------------------------------------------------------------
+# Builder integration
+# ---------------------------------------------------------------------------
+
+
+async def build_app(client, space_id: str, user_id: str, params: dict) -> dict:
+    """Launch the builder agent as a background asyncio task.
+
+    The builder runs autonomously — adds blocks to the entity one by one
+    via Supabase writes. CDC pushes each change to the frontend.
+    """
+    import asyncio
+
+    from agent.builder import builder_loop
+    from config import acreate_client, create_anthropic_client
+
+    entity_id = params["entity_id"]
+    spec = params["spec"]
+
+    # Fresh clients for the background task — independent of request lifecycle
+    builder_supabase = await acreate_client()
+    anthropic_client = create_anthropic_client()
+
+    async def _run_builder():
+        try:
+            await builder_loop(
+                supabase_client=builder_supabase,
+                anthropic_client=anthropic_client,
+                entity_id=entity_id,
+                space_id=space_id,
+                spec=spec,
+            )
+        except Exception as e:
+            logger.error(
+                "builder_task_crashed",
+                extra={"entity_id": entity_id, "error": str(e)[:500]},
+            )
+
+    asyncio.create_task(_run_builder())
+
+    return {"ok": True, "message": "Builder started", "entity_id": entity_id}
+
+
+# ---------------------------------------------------------------------------
 # Tool dispatcher
 # ---------------------------------------------------------------------------
 
@@ -506,9 +573,9 @@ async def execute_tool(client, name: str, params: dict, space_id: str, user_id: 
         "read_entity": read_entity,
         "query_entities": query_entities,
         "update_entity": update_entity,
-        # SPIKE: entity-as-mcp
         "get_entity_schema": get_entity_schema,
         "call_entity_tool": call_entity_tool,
+        "build_app": build_app,
     }
     fn = tools.get(name)
     if fn is None:

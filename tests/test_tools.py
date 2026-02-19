@@ -27,7 +27,6 @@ class TestToolDefinitionsStructure:
         names = [defn["name"] for defn in TOOL_DEFINITIONS]
         expected = [
             "create_entity", "update_entity", "query_entities", "read_entity",
-            # SPIKE: entity-as-mcp
             "get_entity_schema", "call_entity_tool",
         ]
         assert names == expected
@@ -986,7 +985,7 @@ class TestCheckBatchImageQuota:
 
 
 # ---------------------------------------------------------------------------
-# SPIKE: entity-as-mcp — tool definition and handler tests
+# Entity schema discovery and tool call handler tests
 # ---------------------------------------------------------------------------
 
 

@@ -26,7 +26,6 @@ DOMUS_SERVICE_TOKEN: str = os.environ["DOMUS_SERVICE_TOKEN"]
 GOOGLE_API_KEY: str = os.environ.get("GOOGLE_API_KEY", "")
 PERPLEXITY_API_KEY: str = os.environ.get("PERPLEXITY_API_KEY", "")
 
-# SPIKE: entity-as-mcp — frontend URL for schema/tool routes
 DOMUS_FRONTEND_URL: str = os.environ.get("DOMUS_FRONTEND_URL", "http://localhost:3000")
 
 

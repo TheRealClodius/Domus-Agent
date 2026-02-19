@@ -47,6 +47,7 @@ def setup_logging(level: int = logging.INFO) -> None:
     """Configure the root logger with JSON output to stderr.
 
     Safe to call multiple times — clears existing handlers first.
+    Also adds a dedicated builder log file at logs/builder.jsonl.
     """
     root = logging.getLogger()
     root.setLevel(level)
@@ -57,6 +58,33 @@ def setup_logging(level: int = logging.INFO) -> None:
     handler = logging.StreamHandler(sys.stderr)
     handler.setFormatter(_JsonFormatter())
     root.addHandler(handler)
+
+    # Builder-specific file handler — tail -f logs/builder.jsonl in another terminal
+    _setup_builder_log()
+
+
+class _BuilderFilter(logging.Filter):
+    """Only passes records from agent.builder or with builder_ in the message."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.name == "agent.builder":
+            return True
+        msg = record.getMessage()
+        return msg.startswith("builder_")
+
+
+def _setup_builder_log() -> None:
+    """Add a file handler for builder logs at logs/builder.jsonl."""
+    import os
+
+    log_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, "builder.jsonl")
+
+    fh = logging.FileHandler(log_path, mode="a")
+    fh.setFormatter(_JsonFormatter())
+    fh.addFilter(_BuilderFilter())
+    logging.getLogger().addHandler(fh)
 
 
 def get_logger(name: str) -> logging.Logger:
