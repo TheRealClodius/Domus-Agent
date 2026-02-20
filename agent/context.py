@@ -4,6 +4,8 @@ import json
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
+from agent.prompts.iframe_builder import IFRAME_BUILDER_CONTEXT
+
 
 async def get_entity_index(client, space_id: str) -> list[dict]:
     """Get all non-archived entities for the space (including hidden).
@@ -99,7 +101,8 @@ You have access to these tools:
 - read_entity: Get full details of a specific entity
 - get_entity_schema: Discover what structured actions an app entity supports
 - call_entity_tool: Execute a structured action on an app entity
-- build_app: Launch the background builder to construct a composed app (entity must exist first)
+- build_app: Generate a custom interactive app (React + shadcn/ui in a sandboxed iframe)
+- update_app: Update a generated app's code, schema, or state
 
 When creating entities, always provide a clear summary.
 
@@ -136,12 +139,12 @@ calendar_event:
   presentation: 'hidden'
   Example: create_entity(type='calendar_event', presentation='hidden', state={ title: 'Team standup', start: '2026-02-17T15:00:00', end: '2026-02-17T15:30:00', all_day: false, attendees: ['Alice', 'Bob'] }, summary='Team standup at 3pm')
 
-=== Composed Apps (runtime-generated) ===
-When a user asks for a custom app (trip planner, tracker, dashboard, etc.), use the build_app flow:
-1. create_entity(type='composed', state={ building: true, blocks: [], icon: '<lucide-icon-name>' }, summary='...', size={ width: 480, height: 520 })
-2. build_app(entity_id=<id from step 1>, spec='detailed description of what to build')
-The builder runs in the background — you are free to continue chatting. The user will see blocks appear one by one.
-After the build completes, you can interact with the app via get_entity_schema + call_entity_tool.
+=== Generated Apps (iframe-sandboxed) ===
+When a user asks for a custom app (trip planner, tracker, dashboard, etc.), use build_app directly:
+  build_app(name='...', icon='...', description='...', code='...', schema=[...], initial_state={...})
+This creates a new app entity with type='app'. The React code runs in a sandboxed iframe.
+After building, use get_entity_schema + call_entity_tool to test and interact with it.
+Use update_app(entity_id=..., code=..., schema=..., state_patch=...) to iterate and fix issues.
 
 Pick an icon name from this list (kebab-case, used in the dock):
 plane, map-pin, list-checks, utensils, dumbbell, heart-pulse, graduation-cap,
@@ -178,7 +181,7 @@ async def build_system_prompt(
     5. Recent conversation turns
     6. Current date and time
     """
-    parts = [_BASE_INSTRUCTIONS.strip()]
+    parts = [_BASE_INSTRUCTIONS.strip(), IFRAME_BUILDER_CONTEXT.strip()]
 
     # Space name (non-critical — degrade gracefully if table missing)
     try:
