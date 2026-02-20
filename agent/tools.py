@@ -214,27 +214,87 @@ TOOL_DEFINITIONS = [
     {
         "name": "build_app",
         "description": (
-            "Launch the app builder to construct a composed app. "
-            "The entity must already exist (use create_entity first with "
-            "type='composed', state={ building: true, blocks: [] }). "
-            "The builder runs in the background — you are free to continue."
+            "Generate a custom interactive app using React and shadcn/ui. "
+            "The app renders in a sandboxed iframe. Write the component code, "
+            "define the MCP tool schema, and set initial state. "
+            "After building, use get_entity_schema and call_entity_tool to test it, "
+            "then use update_app to improve it if needed."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "App display name, e.g. 'Calculator'",
+                },
+                "icon": {
+                    "type": "string",
+                    "description": "Lucide icon name in kebab-case, e.g. 'calculator'",
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Brief description of what the app does",
+                },
+                "code": {
+                    "type": "string",
+                    "description": (
+                        "React component source code (JSX). Must define a function called App. "
+                        "Available in scope without imports: React hooks (useState, useEffect, "
+                        "useCallback, useMemo, useRef), UI components (Button, Input, Slider, "
+                        "Switch, Dialog, Tooltip), all Lucide icons, and useAppState(defaultState) "
+                        "which returns [state, setState] synced to the entity."
+                    ),
+                },
+                "schema": {
+                    "type": "array",
+                    "description": "MCP tool schemas the app exposes to the agent",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "description": {"type": "string"},
+                            "inputSchema": {"type": "object"},
+                        },
+                        "required": ["name", "description", "inputSchema"],
+                    },
+                },
+                "initial_state": {
+                    "type": "object",
+                    "description": "Initial runtime state for the app",
+                },
+                "width": {"type": "integer", "default": 400},
+                "height": {"type": "integer", "default": 500},
+            },
+            "required": ["name", "icon", "description", "code", "schema", "initial_state"],
+        },
+    },
+    {
+        "name": "update_app",
+        "description": (
+            "Update a generated app's code, schema, or state. Use after build_app "
+            "to iterate and improve the app. Only provided fields are updated."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "entity_id": {
                     "type": "string",
-                    "description": "The entity to build into (must already exist)",
+                    "description": "ID of the generated app entity to update",
                 },
-                "spec": {
+                "code": {
                     "type": "string",
-                    "description": (
-                        "Natural language description of what to build. "
-                        "Be specific about content, structure, and purpose."
-                    ),
+                    "description": "Updated React component source code",
+                },
+                "schema": {
+                    "type": "array",
+                    "description": "Updated MCP tool schemas",
+                },
+                "state_patch": {
+                    "type": "object",
+                    "description": "Runtime state keys to update (merge patch)",
                 },
             },
-            "required": ["entity_id", "spec"],
+            "required": ["entity_id"],
         },
     },
 ]
@@ -524,41 +584,74 @@ async def check_batch_image_quota(
 
 
 async def build_app(client, space_id: str, user_id: str, params: dict) -> dict:
-    """Launch the builder agent as a background asyncio task.
+    """Create a generated app entity with React code, schema, and initial state."""
+    state = {
+        "_code": params["code"],
+        "_schema": params["schema"],
+        "_meta": {
+            "name": params["name"],
+            "icon": params["icon"],
+            "description": params.get("description", ""),
+        },
+        **params.get("initial_state", {}),
+    }
 
-    The builder runs autonomously — adds blocks to the entity one by one
-    via Supabase writes. CDC pushes each change to the frontend.
-    """
-    import asyncio
+    row = {
+        "space_id": space_id,
+        "user_id": user_id,
+        "type": "app",
+        "content": "",
+        "presentation": "window",
+        "position": params.get("position", {"x": 100, "y": 100, "locked": False}),
+        "size": {
+            "width": params.get("width", 400),
+            "height": params.get("height", 500),
+        },
+        "state": state,
+        "summary": params["name"],
+        "created_by": "agent",
+    }
 
-    from agent.builder import builder_loop
-    from config import acreate_client, create_anthropic_client
+    result = await client.table("entities").insert(row).execute()
+    entity = result.data[0] if result.data else row
+    return {"ok": True, "entity_id": entity.get("id", ""), "name": params["name"]}
 
+
+async def update_app(client, space_id: str, user_id: str, params: dict) -> dict:
+    """Update a generated app's code, schema, or state."""
     entity_id = params["entity_id"]
-    spec = params["spec"]
 
-    # Fresh clients for the background task — independent of request lifecycle
-    builder_supabase = await acreate_client()
-    anthropic_client = create_anthropic_client()
+    result = await (
+        client.table("entities")
+        .select("state")
+        .eq("id", entity_id)
+        .eq("space_id", space_id)
+        .maybe_single()
+        .execute()
+    )
+    if not result.data:
+        return {"error": "not_found", "id": entity_id}
 
-    async def _run_builder():
-        try:
-            await builder_loop(
-                supabase_client=builder_supabase,
-                anthropic_client=anthropic_client,
-                entity_id=entity_id,
-                space_id=space_id,
-                spec=spec,
-            )
-        except Exception as e:
-            logger.error(
-                "builder_task_crashed",
-                extra={"entity_id": entity_id, "error": str(e)[:500]},
-            )
+    current_state = result.data.get("state", {}) or {}
 
-    asyncio.create_task(_run_builder())
+    if "code" in params:
+        current_state["_code"] = params["code"]
+    if "schema" in params:
+        current_state["_schema"] = params["schema"]
+    if "state_patch" in params:
+        for k, v in params["state_patch"].items():
+            if not k.startswith("_"):
+                current_state[k] = v
 
-    return {"ok": True, "message": "Builder started", "entity_id": entity_id}
+    await (
+        client.table("entities")
+        .update({"state": current_state})
+        .eq("id", entity_id)
+        .eq("space_id", space_id)
+        .execute()
+    )
+
+    return {"ok": True, "entity_id": entity_id}
 
 
 # ---------------------------------------------------------------------------
@@ -576,6 +669,7 @@ async def execute_tool(client, name: str, params: dict, space_id: str, user_id: 
         "get_entity_schema": get_entity_schema,
         "call_entity_tool": call_entity_tool,
         "build_app": build_app,
+        "update_app": update_app,
     }
     fn = tools.get(name)
     if fn is None:
