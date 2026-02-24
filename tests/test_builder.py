@@ -1,15 +1,13 @@
 """Tests for agent/builder.py — builder loop and tool implementations."""
 
 import json
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from agent.builder import (
     BUILDER_TOOL_DEFINITIONS,
-    _add_block,
-    _update_block,
-    _set_tools_schema,
+    _define_app,
     _finish_build,
     execute_builder_tool,
     builder_loop,
@@ -79,8 +77,8 @@ class _BuilderQueryChain:
 
 @pytest.fixture
 def builder_client():
-    """Provide a BuilderMockClient with empty state."""
-    return BuilderMockClient(initial_state={"building": True, "blocks": []})
+    """Provide a BuilderMockClient with building state."""
+    return BuilderMockClient(initial_state={"building": True, "icon": "list-checks", "name": "Test App"})
 
 
 # ---------------------------------------------------------------------------
@@ -88,87 +86,67 @@ def builder_client():
 # ---------------------------------------------------------------------------
 
 
-class TestAddBlock:
-    """_add_block appends blocks to entity.state.blocks."""
+SAMPLE_VIEW = [
+    {"id": "title", "type": "heading", "props": {"text": "My App"}},
+    {"id": "toggle", "type": "switch", "bind": "active", "props": {"label": "Active"}},
+]
 
-    async def test_add_block_appends_to_empty(self, builder_client):
-        """add_block on empty blocks list creates a one-element list."""
-        block = {"id": "title", "type": "heading", "text": "My App"}
-        result = await _add_block(builder_client, TEST_ENTITY_ID, block)
+SAMPLE_ACTIONS = {
+    "toggle_active": {
+        "type": "toggle",
+        "path": "active",
+        "description": "Toggle active state",
+    }
+}
+
+SAMPLE_STATE = {"active": False}
+
+
+class TestDefineApp:
+    """_define_app writes the full app definition to entity state."""
+
+    async def test_writes_definition_and_state(self, builder_client):
+        """define_app writes _def + state + clears building flag."""
+        result = await _define_app(
+            builder_client,
+            TEST_ENTITY_ID,
+            SAMPLE_VIEW,
+            SAMPLE_ACTIONS,
+            SAMPLE_STATE,
+            "My App — {active}",
+        )
 
         assert result["ok"] is True
-        assert result["block_count"] == 1
-        assert builder_client._state["blocks"] == [block]
+        assert result["component_count"] == 2
+        assert result["action_count"] == 1
 
-    async def test_add_block_appends_to_existing(self):
-        """add_block with existing blocks appends to the end."""
-        existing = {"id": "header", "type": "heading", "text": "Existing"}
+        state = builder_client._state
+        assert state["building"] is False
+        assert state["active"] is False  # app data preserved
+        assert "_def" in state
+
+        _def = state["_def"]
+        assert _def["view"] == SAMPLE_VIEW
+        assert _def["actions"] == SAMPLE_ACTIONS
+        assert _def["summary_template"] == "My App — {active}"
+        assert _def["icon"] == "list-checks"  # preserved from initial state
+
+    async def test_preserves_icon_from_initial_state(self):
+        """define_app preserves the icon set during create_entity."""
         client = BuilderMockClient(
-            initial_state={"building": True, "blocks": [existing]}
+            initial_state={"building": True, "icon": "plane", "name": "Trip"}
         )
+        await _define_app(client, TEST_ENTITY_ID, [], {}, {}, "")
 
-        new_block = {"id": "checklist-1", "type": "checklist", "items": []}
-        result = await _add_block(client, TEST_ENTITY_ID, new_block)
+        assert client._state["_def"]["icon"] == "plane"
+        assert client._state["_def"]["name"] == "Trip"
 
-        assert result["ok"] is True
-        assert result["block_count"] == 2
-        assert client._state["blocks"][0] == existing
-        assert client._state["blocks"][1] == new_block
+    async def test_defaults_icon_to_box(self):
+        """define_app defaults to 'box' icon if none set."""
+        client = BuilderMockClient(initial_state={"building": True})
+        await _define_app(client, TEST_ENTITY_ID, [], {}, {}, "")
 
-
-class TestUpdateBlock:
-    """_update_block patches an existing block by id."""
-
-    async def test_update_block_patches_existing(self):
-        """update_block merges the patch into the matching block."""
-        block = {"id": "metric-1", "type": "metric", "label": "Score", "value": 42}
-        client = BuilderMockClient(
-            initial_state={"building": True, "blocks": [block]}
-        )
-
-        result = await _update_block(
-            client, TEST_ENTITY_ID, "metric-1", {"value": 99}
-        )
-
-        assert result["ok"] is True
-        updated = client._state["blocks"][0]
-        assert updated["value"] == 99
-        assert updated["label"] == "Score"  # preserved
-
-    async def test_update_block_returns_error_for_missing(self, builder_client):
-        """update_block with a non-existent block_id returns error."""
-        result = await _update_block(
-            builder_client, TEST_ENTITY_ID, "nonexistent", {"value": 1}
-        )
-
-        assert result["ok"] is False
-        assert "not found" in result["error"].lower()
-
-
-class TestSetToolsSchema:
-    """_set_tools_schema writes tools array to state."""
-
-    async def test_writes_tools_array(self, builder_client):
-        """set_tools_schema writes the tools list to state.tools."""
-        tools = [
-            {
-                "name": "toggle_item",
-                "description": "Toggle a checklist item",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "block_id": {"type": "string"},
-                        "item_id": {"type": "string"},
-                    },
-                },
-            }
-        ]
-
-        result = await _set_tools_schema(builder_client, TEST_ENTITY_ID, tools)
-
-        assert result["ok"] is True
-        assert result["tool_count"] == 1
-        assert builder_client._state["tools"] == tools
+        assert client._state["_def"]["icon"] == "box"
 
 
 class TestFinishBuild:
@@ -192,35 +170,19 @@ class TestFinishBuild:
 class TestExecuteBuilderTool:
     """execute_builder_tool dispatches to the correct handler."""
 
-    async def test_dispatch_add_block(self, builder_client):
-        block = {"id": "b1", "type": "text", "content": "hello"}
+    async def test_dispatch_define_app(self, builder_client):
         result = await execute_builder_tool(
             builder_client, TEST_ENTITY_ID, TEST_SPACE_ID,
-            "add_block", {"block": block},
+            "define_app",
+            {
+                "view": SAMPLE_VIEW,
+                "actions": SAMPLE_ACTIONS,
+                "state": SAMPLE_STATE,
+                "summary_template": "test",
+            },
         )
         assert result["ok"] is True
-        assert builder_client._state["blocks"] == [block]
-
-    async def test_dispatch_update_block(self):
-        block = {"id": "b1", "type": "text", "content": "old"}
-        client = BuilderMockClient(
-            initial_state={"building": True, "blocks": [block]}
-        )
-        result = await execute_builder_tool(
-            client, TEST_ENTITY_ID, TEST_SPACE_ID,
-            "update_block", {"block_id": "b1", "patch": {"content": "new"}},
-        )
-        assert result["ok"] is True
-        assert client._state["blocks"][0]["content"] == "new"
-
-    async def test_dispatch_set_tools_schema(self, builder_client):
-        tools = [{"name": "t", "description": "d", "inputSchema": {}}]
-        result = await execute_builder_tool(
-            builder_client, TEST_ENTITY_ID, TEST_SPACE_ID,
-            "set_tools_schema", {"tools": tools},
-        )
-        assert result["ok"] is True
-        assert builder_client._state["tools"] == tools
+        assert "_def" in builder_client._state
 
     async def test_dispatch_finish_build(self, builder_client):
         result = await execute_builder_tool(
@@ -236,6 +198,15 @@ class TestExecuteBuilderTool:
             "nonexistent_tool", {},
         )
         assert "error" in result
+
+    async def test_missing_field_returns_error(self, builder_client):
+        """define_app with missing required field returns error."""
+        result = await execute_builder_tool(
+            builder_client, TEST_ENTITY_ID, TEST_SPACE_ID,
+            "define_app", {"view": []},  # missing actions, state, summary_template
+        )
+        assert result["ok"] is False
+        assert "Missing required field" in result["error"]
 
 
 # ---------------------------------------------------------------------------
@@ -294,27 +265,31 @@ class TestBuilderLoop:
 
         assert builder_client._state["building"] is False
 
-    async def test_processes_tool_calls(self, builder_client):
-        """When Anthropic returns tool_use blocks, builder executes each tool."""
-        block = {"id": "title", "type": "heading", "text": "Todo"}
+    async def test_processes_define_app_call(self, builder_client):
+        """When Anthropic returns define_app tool call, builder writes the definition."""
+        define_input = {
+            "view": SAMPLE_VIEW,
+            "actions": SAMPLE_ACTIONS,
+            "state": SAMPLE_STATE,
+            "summary_template": "Test",
+        }
 
-        # First response: tool call to add_block.
-        # Second response: text-only to end the loop.
         mock_anthropic = MagicMock()
         mock_anthropic.messages = MagicMock()
         mock_anthropic.messages.create = AsyncMock(
             side_effect=[
-                _make_tool_response([("add_block", {"block": block})]),
+                _make_tool_response([("define_app", define_input)]),
                 _make_text_response("Done"),
             ]
         )
 
         await builder_loop(
             builder_client, mock_anthropic,
-            TEST_ENTITY_ID, TEST_SPACE_ID, "Build a todo app",
+            TEST_ENTITY_ID, TEST_SPACE_ID, "Build a test app",
         )
 
-        assert builder_client._state["blocks"] == [block]
+        assert "_def" in builder_client._state
+        assert builder_client._state["_def"]["view"] == SAMPLE_VIEW
         assert builder_client._state["building"] is False
 
     async def test_handles_errors_gracefully(self, builder_client):
@@ -335,12 +310,12 @@ class TestBuilderLoop:
 
 
 # ---------------------------------------------------------------------------
-# Builder prompt test
+# Builder prompt tests
 # ---------------------------------------------------------------------------
 
 
 class TestBuilderPrompt:
-    """build_builder_prompt includes the spec."""
+    """build_builder_prompt includes the spec and new references."""
 
     def test_includes_spec(self):
         """The spec text appears in the generated prompt."""
@@ -348,17 +323,32 @@ class TestBuilderPrompt:
         prompt = build_builder_prompt(spec)
         assert spec in prompt
 
-    def test_includes_block_library(self):
-        """The prompt includes the block type reference."""
+    def test_includes_component_catalog(self):
+        """The prompt includes component types from the catalog."""
         prompt = build_builder_prompt("anything")
         assert "heading" in prompt
         assert "checklist" in prompt
         assert "key-value" in prompt
+        assert "switch" in prompt
+        assert "slider" in prompt
+
+    def test_includes_action_dsl(self):
+        """The prompt includes the action DSL reference."""
+        prompt = build_builder_prompt("anything")
+        assert "toggle_in_array" in prompt
+        assert "$param" in prompt
+        assert "set_many" in prompt
+
+    def test_includes_examples(self):
+        """The prompt includes complete app examples."""
+        prompt = build_builder_prompt("anything")
+        assert "Habit Tracker" in prompt
+        assert "Trip Planner" in prompt
 
     def test_includes_design_context(self):
         """The prompt includes design direction."""
         prompt = build_builder_prompt("anything")
-        assert "text-on-surface" in prompt
+        assert "minimal" in prompt
 
 
 # ---------------------------------------------------------------------------
@@ -369,15 +359,23 @@ class TestBuilderPrompt:
 class TestBuilderToolDefinitions:
     """BUILDER_TOOL_DEFINITIONS is a well-formed list."""
 
-    def test_has_four_tools(self):
-        assert len(BUILDER_TOOL_DEFINITIONS) == 4
+    def test_has_two_tools(self):
+        assert len(BUILDER_TOOL_DEFINITIONS) == 2
 
     def test_tool_names(self):
         names = [d["name"] for d in BUILDER_TOOL_DEFINITIONS]
-        assert names == ["add_block", "update_block", "set_tools_schema", "finish_build"]
+        assert names == ["define_app", "finish_build"]
 
     def test_each_has_required_keys(self):
         for defn in BUILDER_TOOL_DEFINITIONS:
             assert "name" in defn
             assert "description" in defn
             assert "input_schema" in defn
+
+    def test_define_app_has_required_properties(self):
+        define_app = BUILDER_TOOL_DEFINITIONS[0]
+        required = define_app["input_schema"]["required"]
+        assert "view" in required
+        assert "actions" in required
+        assert "state" in required
+        assert "summary_template" in required

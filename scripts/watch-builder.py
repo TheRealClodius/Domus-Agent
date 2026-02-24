@@ -47,14 +47,12 @@ def format_line(data: dict) -> str | None:
         status = f"{GREEN}✓{RESET}" if ok else f"{RED}✗{RESET}"
 
         detail = ""
-        if tool == "add_block":
-            bt = data.get("block_type", "?")
-            bi = data.get("block_id", "?")
-            detail = f"  {CYAN}{bt}{RESET} id={bi}"
-        elif tool == "update_block":
-            detail = f"  id={data.get('block_id', '?')}"
-        elif tool == "set_tools_schema":
-            detail = f"  {data.get('tool_count', 0)} tools"
+        if tool == "define_app":
+            cc = data.get("component_count", "?")
+            ac = data.get("action_count", "?")
+            detail = f"  {CYAN}{cc} components, {ac} actions{RESET}"
+        elif tool == "finish_build":
+            detail = ""
 
         error = data.get("error", "")
         if error:

@@ -27,7 +27,7 @@ class TestToolDefinitionsStructure:
         names = [defn["name"] for defn in TOOL_DEFINITIONS]
         expected = [
             "create_entity", "update_entity", "query_entities", "read_entity",
-            "get_entity_schema", "call_entity_tool",
+            "get_entity_schema", "call_entity_tool", "build_app",
         ]
         assert names == expected
 

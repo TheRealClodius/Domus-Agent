@@ -1,8 +1,8 @@
-"""Builder agent — background task that constructs composed apps block by block.
+"""Builder agent — background task that constructs composed apps.
 
 Launched by the main Domus Agent via build_app tool. Runs as an asyncio task
-on the same service. Writes blocks to Supabase one by one; CDC pushes each
-block to the frontend in real-time.
+on the same service. Writes the full app definition to Supabase in one shot;
+CDC pushes the result to the frontend.
 """
 
 import json
@@ -18,72 +18,52 @@ logger = get_logger("agent.builder")
 
 BUILDER_TOOL_DEFINITIONS = [
     {
-        "name": "add_block",
+        "name": "define_app",
         "description": (
-            "Add a UI block to the app. Each block appears on the user's screen "
-            "immediately. Blocks are appended in order."
+            "Set the complete app definition in one shot. This writes the view tree, "
+            "actions, initial state, and summary template to the entity. "
+            "The app becomes interactive immediately. Clears the building flag."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "block": {
+                "view": {
+                    "type": "array",
+                    "description": (
+                        "Array of ViewNode objects defining the UI tree. "
+                        "Each node has: type, id (optional), props (optional), "
+                        "bind (optional dot-path into state), action (optional named action), "
+                        "children (optional array of child node ids), "
+                        "visible (optional dot-path for conditional rendering)."
+                    ),
+                    "items": {"type": "object"},
+                },
+                "actions": {
                     "type": "object",
                     "description": (
-                        "The block to add. Must include type, id, and type-specific fields. "
-                        "Types: heading, text, checklist, key-value, table, metric, progress, divider, list."
+                        "Map of action_name → ActionDefinition. Each definition has: "
+                        "type (set|toggle|increment|append|remove_from_array|toggle_in_array|set_many), "
+                        "path, value, clamp, template, key, field, assignments, description."
+                    ),
+                },
+                "state": {
+                    "type": "object",
+                    "description": "Initial app data (NOT including _def — that's written automatically).",
+                },
+                "summary_template": {
+                    "type": "string",
+                    "description": (
+                        "Template string with {path} placeholders for generating the entity summary. "
+                        "Example: '{name} — {items} items packed'"
                     ),
                 },
             },
-            "required": ["block"],
-        },
-    },
-    {
-        "name": "update_block",
-        "description": "Update an existing block by id. Merges the patch into the block.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "block_id": {
-                    "type": "string",
-                    "description": "The id of the block to update",
-                },
-                "patch": {
-                    "type": "object",
-                    "description": "Fields to merge into the block",
-                },
-            },
-            "required": ["block_id", "patch"],
-        },
-    },
-    {
-        "name": "set_tools_schema",
-        "description": (
-            "Define the tools that the main Domus Agent can use to interact with "
-            "this app after it's built. Each tool maps to a block mutation."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "tools": {
-                    "type": "array",
-                    "description": "Array of MCP tool schemas",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "name": {"type": "string"},
-                            "description": {"type": "string"},
-                            "inputSchema": {"type": "object"},
-                        },
-                        "required": ["name", "description", "inputSchema"],
-                    },
-                },
-            },
-            "required": ["tools"],
+            "required": ["view", "actions", "state", "summary_template"],
         },
     },
     {
         "name": "finish_build",
-        "description": "Mark the app as fully built. Removes the building indicator.",
+        "description": "Mark the app as fully built. Safety net — define_app already clears the building flag.",
         "input_schema": {
             "type": "object",
             "properties": {},
@@ -121,39 +101,30 @@ async def _write_entity_state(client, entity_id: str, state: dict) -> None:
     )
 
 
-async def _add_block(client, entity_id: str, block: dict) -> dict:
-    """Append a block to entity.state.blocks."""
-    state = await _read_entity_state(client, entity_id)
-    blocks = list(state.get("blocks", []))
-    blocks.append(block)
-    state["blocks"] = blocks
-    await _write_entity_state(client, entity_id, state)
-    return {"ok": True, "block_count": len(blocks)}
+async def _define_app(
+    client, entity_id: str, view: list, actions: dict, state: dict, summary_template: str
+) -> dict:
+    """Write the full app definition to entity.state and clear building flag."""
+    current = await _read_entity_state(client, entity_id)
 
+    # Preserve icon from the initial create_entity call
+    icon = current.get("icon", "box")
 
-async def _update_block(client, entity_id: str, block_id: str, patch: dict) -> dict:
-    """Update an existing block by merging patch."""
-    state = await _read_entity_state(client, entity_id)
-    blocks = list(state.get("blocks", []))
-    found = False
-    for i, b in enumerate(blocks):
-        if b.get("id") == block_id:
-            blocks[i] = {**b, **patch}
-            found = True
-            break
-    if not found:
-        return {"ok": False, "error": f"Block {block_id} not found"}
-    state["blocks"] = blocks
-    await _write_entity_state(client, entity_id, state)
-    return {"ok": True}
+    # Build the new state: _def holds the definition, rest is app data
+    new_state = {
+        **state,
+        "_def": {
+            "view": view,
+            "actions": actions,
+            "summary_template": summary_template,
+            "name": current.get("name", "App"),
+            "icon": icon,
+        },
+        "building": False,
+    }
 
-
-async def _set_tools_schema(client, entity_id: str, tools: list[dict]) -> dict:
-    """Write the tools schema to entity.state.tools."""
-    state = await _read_entity_state(client, entity_id)
-    state["tools"] = tools
-    await _write_entity_state(client, entity_id, state)
-    return {"ok": True, "tool_count": len(tools)}
+    await _write_entity_state(client, entity_id, new_state)
+    return {"ok": True, "component_count": len(view), "action_count": len(actions)}
 
 
 async def _finish_build(client, entity_id: str) -> dict:
@@ -169,14 +140,15 @@ async def execute_builder_tool(
 ) -> dict:
     """Dispatch a builder tool call."""
     try:
-        if tool_name == "add_block":
-            return await _add_block(client, entity_id, tool_input["block"])
-        elif tool_name == "update_block":
-            return await _update_block(
-                client, entity_id, tool_input["block_id"], tool_input["patch"]
+        if tool_name == "define_app":
+            return await _define_app(
+                client,
+                entity_id,
+                tool_input["view"],
+                tool_input["actions"],
+                tool_input["state"],
+                tool_input["summary_template"],
             )
-        elif tool_name == "set_tools_schema":
-            return await _set_tools_schema(client, entity_id, tool_input["tools"])
         elif tool_name == "finish_build":
             return await _finish_build(client, entity_id)
         else:
@@ -197,10 +169,10 @@ async def builder_loop(
     space_id: str,
     spec: str,
 ):
-    """Background task: build a composed app block by block.
+    """Background task: build a composed app.
 
     Runs as an asyncio.create_task() — fully autonomous, no SSE streaming.
-    Each tool call writes to Supabase; CDC pushes changes to frontend.
+    The builder generates the full app definition in one define_app call.
     """
     logger.info(
         "builder_start",
@@ -211,7 +183,7 @@ async def builder_loop(
     messages = [{"role": "user", "content": spec}]
 
     try:
-        max_turns = 20  # Safety limit
+        max_turns = 10  # Safety limit (typically completes in 1-2 turns)
         for turn in range(max_turns):
             logger.info(
                 "builder_turn_start",
@@ -222,7 +194,7 @@ async def builder_loop(
                 system=system,
                 messages=messages,
                 tools=BUILDER_TOOL_DEFINITIONS,
-                max_tokens=4096,
+                max_tokens=16384,
             )
 
             # Log any text the model produced (thinking/planning)
@@ -256,16 +228,15 @@ async def builder_loop(
                 )
                 results.append(result)
 
-                # Detailed tool call log
-                tool_detail = {"entity_id": entity_id, "tool": tc.name, "turn": turn, "result_ok": result.get("ok", False)}
-                if tc.name == "add_block":
-                    block = tc.input.get("block", {})
-                    tool_detail["block_type"] = block.get("type")
-                    tool_detail["block_id"] = block.get("id")
-                elif tc.name == "update_block":
-                    tool_detail["block_id"] = tc.input.get("block_id")
-                elif tc.name == "set_tools_schema":
-                    tool_detail["tool_count"] = len(tc.input.get("tools", []))
+                tool_detail = {
+                    "entity_id": entity_id,
+                    "tool": tc.name,
+                    "turn": turn,
+                    "result_ok": result.get("ok", False),
+                }
+                if tc.name == "define_app":
+                    tool_detail["component_count"] = result.get("component_count", 0)
+                    tool_detail["action_count"] = result.get("action_count", 0)
                 if not result.get("ok"):
                     tool_detail["error"] = result.get("error", "")[:200]
                 logger.info("builder_tool_call", extra=tool_detail)
