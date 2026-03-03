@@ -1,11 +1,14 @@
 """Tool definitions and implementations for the Domus Agent.
 
-4 tools for v0: create_entity, update_entity, query_entities, read_entity.
-web_search is deferred.
+5 tools: create_entity, update_entity, query_entities, read_entity, web_search.
+Plus entity-as-MCP helpers: get_entity_schema, call_entity_tool, build_app, update_app.
 
 Definitions live in TOOL_DEFINITIONS (list of dicts for Claude's tools parameter).
 Implementations are async functions that take (client, space_id, user_id, params).
 """
+
+import asyncio
+import time
 
 from agent.logging import get_logger
 
@@ -297,7 +300,28 @@ TOOL_DEFINITIONS = [
             "required": ["entity_id"],
         },
     },
+    {
+        "name": "web_search",
+        "description": "Search the web for current information. Returns a direct answer with source citations.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search query"},
+                "focus": {
+                    "type": "string",
+                    "enum": ["general", "academic", "news"],
+                    "default": "general",
+                    "description": "Search domain focus",
+                },
+            },
+            "required": ["query"],
+        },
+    },
 ]
+
+# Anthropic prompt caching: add cache_control to the last tool definition
+# so all tool definitions are cached as a single breakpoint (5-min Anthropic KV TTL).
+TOOL_DEFINITIONS[-1]["cache_control"] = {"type": "ephemeral"}
 
 
 # ---------------------------------------------------------------------------
@@ -321,7 +345,7 @@ async def create_entity(client, space_id: str, user_id: str, params: dict) -> di
 
         try:
             gen_result = await generate_image(
-                state["generation_prompt"], space_id, client
+                state["generation_prompt"], space_id, client, user_id
             )
             state["image_url"] = gen_result["public_url"]
             state["width"] = gen_result["width"]
@@ -568,16 +592,6 @@ def compute_group_positions(count: int, viewport: dict | None = None) -> list[di
     return positions
 
 
-async def check_batch_image_quota(
-    client, user_id: str, count: int
-) -> tuple[bool, str]:
-    """Check if user can generate `count` images. Returns (allowed, reason).
-
-    Stub — always allows. Will be wired to usage_events + tier system in Phase 12.
-    """
-    return True, ""
-
-
 # ---------------------------------------------------------------------------
 # Builder integration
 # ---------------------------------------------------------------------------
@@ -604,8 +618,8 @@ async def build_app(client, space_id: str, user_id: str, params: dict) -> dict:
         "presentation": "window",
         "position": params.get("position", {"x": 100, "y": 100, "locked": False}),
         "size": {
-            "width": params.get("width", 400),
-            "height": params.get("height", 500),
+            "width": params.get("width", 480),
+            "height": params.get("height", 560),
         },
         "state": state,
         "summary": params["name"],
@@ -655,13 +669,57 @@ async def update_app(client, space_id: str, user_id: str, params: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Web search
+# ---------------------------------------------------------------------------
+
+
+async def web_search(client, space_id: str, user_id: str, params: dict) -> dict:
+    """Search the web via Perplexity API. Returns answer + citations."""
+    import httpx
+    from config import PERPLEXITY_API_KEY
+
+    if not PERPLEXITY_API_KEY:
+        return {"error": "web_search_unavailable", "message": "PERPLEXITY_API_KEY not configured"}
+
+    query = params["query"]
+    focus = params.get("focus", "general")
+    model = "sonar-pro" if focus == "academic" else "sonar"
+
+    async with httpx.AsyncClient() as http:
+        resp = await http.post(
+            "https://api.perplexity.ai/chat/completions",
+            headers={"Authorization": f"Bearer {PERPLEXITY_API_KEY}"},
+            json={"model": model, "messages": [{"role": "user", "content": query}]},
+            timeout=30.0,
+        )
+
+    if resp.status_code != 200:
+        return {"error": "web_search_failed", "status": resp.status_code}
+
+    data = resp.json()
+    answer = data["choices"][0]["message"]["content"]
+    citations = [{"url": url} for url in data.get("citations", [])]
+    return {"answer": answer, "citations": citations}
+
+
+# ---------------------------------------------------------------------------
 # Tool dispatcher
 # ---------------------------------------------------------------------------
 
 
-async def execute_tool(client, name: str, params: dict, space_id: str, user_id: str) -> dict:
-    """Dispatch a tool call by name. Returns the tool result or an error dict."""
-    tools = {
+async def execute_tool(
+    client, name: str, params: dict, space_id: str, user_id: str, tier=None
+) -> dict:
+    """Dispatch a tool call by name. Returns the tool result or an error dict.
+
+    When tier is provided:
+    - Enforces image_generation quota before create_entity with generation_prompt
+    - Enforces web_search quota before web_search
+    - Records a tool_call usage event after every execution (fire-and-forget)
+    """
+    from agent.usage import check_quota, record_usage
+
+    _tools = {
         "create_entity": create_entity,
         "read_entity": read_entity,
         "query_entities": query_entities,
@@ -670,11 +728,45 @@ async def execute_tool(client, name: str, params: dict, space_id: str, user_id: 
         "call_entity_tool": call_entity_tool,
         "build_app": build_app,
         "update_app": update_app,
+        "web_search": web_search,
     }
-    fn = tools.get(name)
+    fn = _tools.get(name)
     if fn is None:
         return {"error": "unknown_tool", "tool": name}
+
+    # Enforce quotas before executing billable tools
+    if tier is not None:
+        if name == "create_entity":
+            state = params.get("state", {}) or {}
+            if params.get("type") == "image" and "generation_prompt" in state:
+                quota = await check_quota(client, user_id, tier, "image_generation")
+                if not quota["allowed"]:
+                    return {
+                        "error": "quota_exhausted",
+                        "type": "image_generation",
+                        "message": f"Image quota exhausted. Resets at {quota['resets_at']}.",
+                    }
+        elif name == "web_search":
+            quota = await check_quota(client, user_id, tier, "web_search")
+            if not quota["allowed"]:
+                return {
+                    "error": "quota_exhausted",
+                    "type": "web_search",
+                    "message": f"Web search quota exhausted. Resets at {quota['resets_at']}.",
+                }
+
+    t0 = time.monotonic()
     try:
-        return await fn(client, space_id, user_id, params)
+        result = await fn(client, space_id, user_id, params)
     except Exception as e:
-        return {"error": "tool_execution_failed", "tool": name, "message": str(e)}
+        result = {"error": "tool_execution_failed", "tool": name, "message": str(e)}
+
+    ms = round((time.monotonic() - t0) * 1000)
+    asyncio.create_task(
+        record_usage(client, space_id, user_id, "tool_call", {
+            "tool_name": name,
+            "duration_ms": ms,
+            "success": "error" not in result,
+        })
+    )
+    return result

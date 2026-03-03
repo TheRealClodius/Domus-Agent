@@ -4,9 +4,13 @@ import asyncio
 import json
 import time
 
+from anthropic import RateLimitError
+
+import config as cfg
 from agent.logging import get_logger, log_tool_execution
 from agent.tools import TOOL_DEFINITIONS, execute_tool
 from agent.context import build_system_prompt
+from agent.usage import Tier, record_usage
 
 logger = get_logger("agent.loop")
 
@@ -95,6 +99,77 @@ def format_sse_event(event: dict) -> str:
 # ---------------------------------------------------------------------------
 
 
+async def _maybe_compact(
+    client, anthropic_client, space_id: str, user_id: str
+) -> None:
+    """Background task: compact conversation if turn threshold exceeded. Never raises."""
+    try:
+        from agent.memory import compact_conversation
+
+        result = await compact_conversation(client, anthropic_client, space_id, user_id)
+        if result.get("compacted"):
+            logger.info(
+                "compaction_triggered",
+                extra={
+                    "space_id": space_id,
+                    "user_id": user_id,
+                    "summary_id": result.get("summary_id"),
+                    "fact_count": result.get("fact_count"),
+                    "turns_archived": result.get("turns_archived"),
+                },
+            )
+    except Exception as e:
+        logger.warning(
+            "compaction_error",
+            extra={"space_id": space_id, "user_id": user_id, "error": str(e)},
+        )
+
+
+async def _maybe_trim_free(client, space_id: str, user_id: str) -> None:
+    """Background task: archive old turns for free-tier users. Never raises."""
+    try:
+        from agent.memory import trim_conversation_free
+
+        await trim_conversation_free(client, space_id)
+    except Exception as e:
+        logger.warning(
+            "free_tier_trim_error",
+            extra={"space_id": space_id, "user_id": user_id, "error": str(e)},
+        )
+
+
+def _log_prompt_sections(logger, blocks: list[dict], **extra) -> None:
+    """Log which context sections are populated in the assembled system prompt.
+
+    Scans block[1] (semi-static) and block[2] (dynamic) for section markers.
+    Emits a single structured log line so you can grep/query in prod to verify
+    situational awareness features are firing.
+    """
+    if not isinstance(blocks, list):
+        return  # gracefully skip if called with a legacy plain-string prompt
+    semi = blocks[1]["text"] if len(blocks) > 1 else ""
+    dynamic = blocks[2]["text"] if len(blocks) > 2 else ""
+    logger.info(
+        "prompt_sections",
+        extra={
+            **extra,
+            # semi-static sections (block 1)
+            "has_recently_active": "Recently Active" in semi,
+            "has_conversation_history": "Conversation History" in semi,
+            "has_agent_personality": "Agent Personality" in semi,
+            "has_user_section": "=== User ===" in semi,
+            # dynamic sections (block 2)
+            "has_canvas_context": "Canvas Context" in dynamic,
+            "has_also_visible": "Also visible" in dynamic,
+            "has_calendar_hint": "calendar_event" in dynamic and "Tip:" in dynamic,
+            "has_session_created": "Created this session" in dynamic,
+            # token pressure proxy
+            "semi_static_chars": len(semi),
+            "dynamic_chars": len(dynamic),
+        },
+    )
+
+
 async def run_agent(
     client,
     anthropic_client,
@@ -107,6 +182,7 @@ async def run_agent(
     visible_entity_ids: list[str] | None = None,
     context_items: list[dict] | None = None,
     user_timezone: str | None = None,
+    tier: "Tier | None" = None,
 ):
     """Run the agent loop. Calls Claude, handles tool calls, streams events.
 
@@ -122,6 +198,7 @@ async def run_agent(
         visible_entity_ids: Entity IDs currently visible on canvas
         context_items: File attachments [{id, name, type, data}] with base64 data URLs
         user_timezone: IANA timezone string (e.g. 'Europe/Bucharest')
+        tier: Resolved billing tier (Tier enum). None = skip tier-gated behaviour.
     """
     if on_event is None:
 
@@ -133,7 +210,7 @@ async def run_agent(
         extra={"space_id": space_id, "user_id": user_id, "user_timezone": user_timezone},
     )
 
-    # Build system prompt
+    # Build system prompt (returns list of cacheable blocks)
     system = await build_system_prompt(
         client, space_id, message,
         viewport=viewport,
@@ -142,6 +219,9 @@ async def run_agent(
         user_id=user_id,
         user_timezone=user_timezone,
     )
+
+    # Log which context sections are populated — useful for verifying situational awareness
+    _log_prompt_sections(logger, system, space_id=space_id, user_id=user_id)
 
     # Save user turn (text only — don't persist base64 attachments)
     await save_conversation_turn(client, space_id, user_id, "user", message)
@@ -158,14 +238,52 @@ async def run_agent(
 
     try:
         while True:
-            # Call Claude (non-streaming for v0)
-            response = await anthropic_client.messages.create(
-                model="claude-sonnet-4-5-20250929",
-                system=system,
-                messages=messages,
-                tools=TOOL_DEFINITIONS,
-                max_tokens=4096,
-            )
+            # Call Claude
+            try:
+                response = await anthropic_client.messages.create(
+                    model=cfg.AGENT_MODEL,
+                    system=system,
+                    messages=messages,
+                    tools=TOOL_DEFINITIONS,
+                    max_tokens=4096,
+                )
+            except RateLimitError:
+                logger.warning(
+                    "anthropic_rate_limit",
+                    extra={"space_id": space_id, "user_id": user_id},
+                )
+                await on_event({
+                    "type": "error",
+                    "message": "The agent is at capacity — please try again in a moment.",
+                    "code": "rate_limit",
+                })
+                return ""
+
+            # Log token usage and record billable event
+            if hasattr(response, "usage"):
+                u = response.usage
+                logger.info(
+                    "anthropic_token_usage",
+                    extra={
+                        "space_id": space_id,
+                        "user_id": user_id,
+                        "input_tokens": getattr(u, "input_tokens", 0),
+                        "output_tokens": getattr(u, "output_tokens", 0),
+                        "cache_creation_input_tokens": getattr(
+                            u, "cache_creation_input_tokens", 0
+                        ),
+                        "cache_read_input_tokens": getattr(
+                            u, "cache_read_input_tokens", 0
+                        ),
+                    },
+                )
+                asyncio.create_task(
+                    record_usage(client, space_id, user_id, "agent_turn", {
+                        "input_tokens": getattr(u, "input_tokens", 0),
+                        "output_tokens": getattr(u, "output_tokens", 0),
+                        "model": cfg.AGENT_MODEL,
+                    })
+                )
 
             # Process response content blocks
             text_parts = []
@@ -209,7 +327,9 @@ async def run_agent(
             # Execute tool calls in parallel
             async def _timed_execute(tc, params):
                 t = time.monotonic()
-                result = await execute_tool(client, tc.name, params, space_id, user_id)
+                result = await execute_tool(
+                    client, tc.name, params, space_id, user_id, tier=tier
+                )
                 ms = (time.monotonic() - t) * 1000
                 log_tool_execution(logger, tc.name, ms, space_id=space_id, user_id=user_id)
                 return result
@@ -227,26 +347,47 @@ async def run_agent(
                     {"type": "tool_call_result", "id": tc.id, "result": result}
                 )
 
-            # Append assistant message and tool results for next turn
+            # Append assistant message to conversation
             messages.append({"role": "assistant", "content": response.content})
-            messages.append(
+
+            # Build tool_result blocks for this iteration
+            tool_result_blocks = [
                 {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": tc.id,
-                            "content": json.dumps(r),
-                        }
-                        for tc, r in zip(tool_use_blocks, results)
-                    ],
+                    "type": "tool_result",
+                    "tool_use_id": tc.id,
+                    "content": json.dumps(r),
                 }
-            )
+                for tc, r in zip(tool_use_blocks, results)
+            ]
+
+            # Rolling cache: strip cache_control from ALL previous tool_result messages,
+            # then mark only the last block of the current batch as ephemeral.
+            # This keeps exactly one breakpoint (breakpoint 4) active at all times.
+            for msg in messages:
+                if msg.get("role") == "user" and isinstance(msg.get("content"), list):
+                    for block in msg["content"]:
+                        if block.get("type") == "tool_result":
+                            block.pop("cache_control", None)
+
+            if tool_result_blocks:
+                tool_result_blocks[-1]["cache_control"] = {"type": "ephemeral"}
+
+            messages.append({"role": "user", "content": tool_result_blocks})
 
         # Save assistant turn
         await save_conversation_turn(
             client, space_id, user_id, "assistant", assistant_text
         )
+
+        # Schedule background memory management
+        if tier == Tier.FREE:
+            # No Opus budget — silently archive old turns to keep context bounded
+            asyncio.create_task(_maybe_trim_free(client, space_id, user_id))
+        else:
+            asyncio.create_task(
+                _maybe_compact(client, anthropic_client, space_id, user_id)
+            )
+
         await on_event({"type": "done"})
 
     except Exception as e:

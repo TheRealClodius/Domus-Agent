@@ -24,7 +24,7 @@ def _generate_image_sync(prompt: str, api_key: str) -> tuple[bytes, int, int]:
     """Sync: call Gemini, validate with PIL, return (png_bytes, width, height)."""
     client = genai.Client(api_key=api_key)
     response = client.models.generate_content(
-        model="gemini-2.5-flash-image",
+        model=config.IMAGE_GEN_MODEL,
         contents=[prompt],
         config=types.GenerateContentConfig(
             response_modalities=["IMAGE"],
@@ -41,19 +41,21 @@ def _generate_image_sync(prompt: str, api_key: str) -> tuple[bytes, int, int]:
 
 
 async def generate_image(
-    prompt: str, space_id: str, supabase_client
+    prompt: str, space_id: str, supabase_client, user_id: str = ""
 ) -> dict:
     """Generate an image from a text prompt and upload to Supabase Storage.
 
     Pipeline:
     1. Call Gemini via asyncio.to_thread (non-blocking)
     2. Upload PNG bytes to Supabase Storage
-    3. Return metadata dict
+    3. Record image_generation usage event (fire-and-forget)
+    4. Return metadata dict
 
     Args:
         prompt: Text description of the image to generate
         space_id: Space ID for storage path namespacing
         supabase_client: Async Supabase client with storage access
+        user_id: User ID for usage tracking
 
     Returns:
         dict with keys: storage_path, public_url, width, height
@@ -88,6 +90,16 @@ async def generate_image(
             "height": height,
         },
     )
+
+    # 4. Record billable event (fire-and-forget)
+    if user_id:
+        from agent.usage import record_usage
+        asyncio.create_task(
+            record_usage(supabase_client, space_id, user_id, "image_generation", {
+                "model": config.IMAGE_GEN_MODEL,
+                "prompt_length": len(prompt),
+            })
+        )
 
     return {
         "storage_path": storage_path,

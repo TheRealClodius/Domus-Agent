@@ -1,12 +1,17 @@
-"""Builder agent — background task that constructs composed apps.
+"""Builder agent — background task that constructs declarative apps.
 
-Launched by the main Domus Agent via build_app tool. Runs as an asyncio task
-on the same service. Writes the full app definition to Supabase in one shot;
-CDC pushes the result to the frontend.
+Invoked via builder_loop(supabase, anthropic, entity_id, space_id, spec).
+Not yet wired into any agent tool — currently called only in tests and directly.
+Runs as an asyncio.create_task(); writes the full app definition to Supabase
+in one shot via define_app; CDC pushes the result to the frontend.
+
+Note: build_app in tools.py creates React iframe apps (state._code) — a separate
+system. This builder produces declarative view-tree apps (state._def).
 """
 
 import json
 
+import config as cfg
 from agent.logging import get_logger
 from agent.prompts.builder import build_builder_prompt
 
@@ -190,7 +195,7 @@ async def builder_loop(
                 extra={"entity_id": entity_id, "turn": turn},
             )
             response = await anthropic_client.messages.create(
-                model="claude-sonnet-4-5-20250929",
+                model=cfg.BUILDER_MODEL,
                 system=system,
                 messages=messages,
                 tools=BUILDER_TOOL_DEFINITIONS,

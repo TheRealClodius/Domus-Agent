@@ -28,6 +28,39 @@ PERPLEXITY_API_KEY: str = os.environ.get("PERPLEXITY_API_KEY", "")
 
 DOMUS_FRONTEND_URL: str = os.environ.get("DOMUS_FRONTEND_URL", "http://localhost:3000")
 
+# Model selection — override via .env to switch without code changes
+AGENT_MODEL: str = os.environ.get("AGENT_MODEL", "claude-sonnet-4-6")
+BUILDER_MODEL: str = os.environ.get("BUILDER_MODEL", "claude-sonnet-4-6")
+IMAGE_GEN_MODEL: str = os.environ.get("IMAGE_GEN_MODEL", "gemini-2.5-flash-image")
+COMPACTION_MODEL: str = os.environ.get("COMPACTION_MODEL", "claude-opus-4-6")
+
+# Memory compaction — trigger when accumulated turns exceed heuristic
+COMPACTION_TURN_THRESHOLD: int = 40
+
+# Debug — expose /debug/prompt endpoint (off by default, never enable in prod)
+DEBUG_PROMPT_ENABLED: bool = os.getenv("DEBUG_PROMPT_ENABLED", "false").lower() == "true"
+
+# ---------------------------------------------------------------------------
+# Billing tier limits (daily quotas per event_type)
+# ---------------------------------------------------------------------------
+
+TIER_LIMITS: dict = {
+    "free":    {"agent_turn": 10,   "image_generation": 0,   "web_search": 5},
+    "citizen": {"agent_turn": 200,  "image_generation": 20,  "web_search": 50},
+    "extra":   {"agent_turn": 1000, "image_generation": 100, "web_search": 200},
+}
+
+RATE_LIMITS: dict = {
+    "free":    {"requests_per_minute": 5,  "concurrent_turns": 1},   # concurrent_turns: defined, not yet enforced
+    "citizen": {"requests_per_minute": 20, "concurrent_turns": 2},
+    "extra":   {"requests_per_minute": 60, "concurrent_turns": 5},
+}
+
+
+# ---------------------------------------------------------------------------
+# Client factories
+# ---------------------------------------------------------------------------
+
 
 async def acreate_client():
     """Create an async Supabase client with service role key (bypasses RLS)."""
@@ -37,7 +70,41 @@ async def acreate_client():
 
 
 def create_anthropic_client():
-    """Create an Anthropic AsyncAnthropic client."""
+    """Create an Anthropic AsyncAnthropic client with timeout and reduced retries."""
+    import httpx
     from anthropic import AsyncAnthropic
 
-    return AsyncAnthropic(api_key=ANTHROPIC_API_KEY, max_retries=5)
+    return AsyncAnthropic(
+        api_key=ANTHROPIC_API_KEY,
+        max_retries=3,  # Reduced from 5; RateLimitError is handled explicitly in the loop
+        timeout=httpx.Timeout(60.0, connect=10.0),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Shared client singleton (initialized once at app startup via lifespan)
+# ---------------------------------------------------------------------------
+
+_shared_anthropic_client = None
+_shared_supabase_client = None
+
+
+def set_shared_clients(anthropic_client, supabase_client) -> None:
+    """Store the shared clients created during app startup."""
+    global _shared_anthropic_client, _shared_supabase_client
+    _shared_anthropic_client = anthropic_client
+    _shared_supabase_client = supabase_client
+
+
+def get_shared_anthropic_client():
+    """Return the shared Anthropic client. Raises if not initialized."""
+    if _shared_anthropic_client is None:
+        raise RuntimeError("Shared Anthropic client not initialized")
+    return _shared_anthropic_client
+
+
+def get_shared_supabase_client():
+    """Return the shared Supabase client. Raises if not initialized."""
+    if _shared_supabase_client is None:
+        raise RuntimeError("Shared Supabase client not initialized")
+    return _shared_supabase_client

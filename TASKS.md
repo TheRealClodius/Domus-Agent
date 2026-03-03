@@ -72,9 +72,9 @@ Test: dispatch to each tool by name, verify routing works.
 The system prompt builder. Queries Supabase for the lightweight context that Claude needs each turn.
 
 ### 2.1 — Entity index ✅
-`get_entity_index(space_id) → list[dict]`. Query all non-archived entities (including hidden). Return `id`, `type`, `presentation`, `z_index`, `summary` for each.
+`get_entity_index(space_id) → list[dict]`. Query all non-archived, non-hidden entities. Return `id`, `type`, `presentation`, `z_index`, `summary` for each. Hidden entities (`conversation_turn`, `fact`, `edge`, etc.) are excluded — they bloat the context without adding spatial signal.
 
-Test: create several entities (mix of visible and hidden, one archived), verify the index includes hidden but excludes archived.
+Test: create several entities (mix of visible and hidden, one archived), verify the index excludes hidden and archived.
 
 ### 2.2 — Recent conversation turns ✅
 `get_recent_turns(space_id, limit=5) → list[dict]`. Query the last N `conversation_turn` entities ordered by `created_at` DESC. Return `state` (which contains `role` and `content`).
@@ -82,15 +82,14 @@ Test: create several entities (mix of visible and hidden, one archived), verify 
 Test: create 7 conversation turn entities, verify only the 5 most recent are returned.
 
 ### 2.3 — System prompt assembly ✅
-`build_system_prompt(space_id, message) → str`. Assembles:
-1. Base instructions (agent identity, tool descriptions)
-2. Entity index from 2.1
-3. Entity state shapes described in system prompt text (e.g., "A note entity has state: { title: string, content: string }"). No schema system or validation layer for v0 — Claude follows the instructions. Schemas and validation arrive when the frontend `/api/schemas` endpoint exists.
-4. Recent turns from 2.2
+`build_system_prompt(...) → list[dict]`. Assembles three cacheable blocks:
+1. **Static block** (`cache_control: ephemeral`): Base instructions + iframe builder context
+2. **Semi-static block** (`cache_control: ephemeral`): Space info + user profile + entity index
+3. **Dynamic block** (no cache_control): Canvas context + recent turns + temporal context
 
-Returns the complete system prompt string. No personality traits or dynamic schema injection yet — those are deferred.
+All Supabase queries run concurrently via `asyncio.gather`. Returns a `list[dict]` of text blocks (not a plain string) for use as the `system` parameter in the Anthropic SDK.
 
-Test: set up a space with entities and turns, verify the assembled prompt contains the expected sections.
+Test: set up a space with entities and turns, verify the assembled blocks contain the expected sections. Verify cache_control is on blocks 0 and 1 but not block 2.
 
 ---
 
@@ -200,11 +199,11 @@ Test: build system prompt with summaries and personality traits present, verify 
 
 ---
 
-## Phase 7: Web Search
+## Phase 7: Web Search ✅
 
 Completes the "5 tools, not 15" contract.
 
-### 7.1 — `web_search` tool
+### 7.1 — `web_search` tool ✅
 
 Add `web_search` to `agent/tools.py`:
 - Params: `query` (string, required), `focus` (enum: `"general"` | `"academic"` | `"news"`, default `"general"`)
@@ -265,7 +264,9 @@ Test: mock Gemini + Storage. Create an image entity, then update with an edit pr
 
 ---
 
-## Phase 9: Knowledge Graph
+## Phase 9: Knowledge Graph *(future consideration)*
+
+> **Deferred.** Over-engineering at current scale. The entity index + focus hints (19.8) cover the immediate context needs without graph infrastructure. Revisit if relationship queries become a real user pain point.
 
 Relationships between entities, stored as entities. Enables "related to this" queries and clustering.
 
@@ -326,6 +327,20 @@ Update `agent/context.py`:
 4. **Composed app context parity:** Include composed app block summaries in the "Relevant App Types" section alongside built-in schemas. For each composed type in the space, derive a block summary from entity data (block types + counts, not full content — e.g., "heading, checklist (5 items), progress"). Same relevance filtering as built-in schemas (visible entities + message intent). This gives the agent equal structural awareness for composed types — no `read_entity` needed just to understand what blocks a type uses.
 
 Test: message "build me a habit tracker" triggers injection. Message "what's the weather" does not. Focused entity with `state.blocks` triggers injection. Composed app types that are visible appear in "Relevant App Types" with block summaries.
+
+### 10.3 — Iframe/sandbox builder agent
+
+Two new tools in `agent/tools.py`:
+- `build_app(title, description, requirements) → dict` — Agent generates a complete React component (TypeScript, shadcn/ui, Tailwind) from a description. Creates an entity with `type='app'`, `state.code` containing the JSX, `state.framework='react-shadcn'`.
+- `update_app(entity_id, change_description) → dict` — Reads current `state.code` via `read_entity`, rewrites or patches the component based on the change description. Full code replacement (not a diff).
+
+`agent/prompts/iframe_builder.py` provides the generation prompt: component constraints (no external imports beyond shadcn/ui + lucide-react, must be a single default export, no fetch calls), design system rules (Domus color tokens, spacing), and a compact example component.
+
+Add both tools to `TOOL_DEFINITIONS` and `execute_tool` dispatcher.
+
+Wire into context: `build_system_prompt` in `agent/context.py` should detect `build`/`create app`/`make a` keywords OR a focused entity with `state.framework='react-shadcn'` and append the iframe builder prompt (already handles block-based detection in 10.2 — extend the same heuristic).
+
+Test: mock Anthropic to return a `build_app` tool call, verify entity is created with `state.code` and `state.framework='react-shadcn'`. Call `update_app` on an existing app entity, verify `read_entity` is called first and `state.code` is updated. Verify both tools dispatch correctly via `execute_tool`. Verify builder prompt injection triggers on "build me a tracker" and does NOT trigger on "what's the weather".
 
 ---
 
@@ -473,6 +488,46 @@ Use `prometheus-client` library. Instrument in the agent loop and tool dispatche
 
 Test: trigger agent runs, scrape `/metrics`, verify counters increment and histograms record values.
 
+### 13.3 — Rich tool call SSE events
+
+Enrich existing SSE event payloads so the frontend can render full tool detail inline in the agent chat (dev mode):
+
+**`tool_call_start` additions:**
+```json
+{
+  "type": "tool_call_start",
+  "tool": "create_entity",
+  "id": "toolu_...",
+  "label": "Creating note",
+  "params": { "type": "note", "content": "..." }
+}
+```
+- `label`: short human-readable description derived from tool + key params (e.g. `"Searching 'capital of France'"`, `"Updating entity abc123"`, `"Generating image"`)
+- `params`: full input params dict (already available at dispatch time — just include it)
+
+**`tool_call_result` additions:**
+```json
+{
+  "type": "tool_call_result",
+  "id": "toolu_...",
+  "success": true,
+  "duration_ms": 134,
+  "result": { ... }
+}
+```
+- `success`: bool (false if result contains `"error"` key)
+- `duration_ms`: wall time from dispatch to result
+
+**Token counts on `done` event:**
+```json
+{ "type": "done", "usage": { "input_tokens": 4200, "output_tokens": 350, "cache_read_input_tokens": 3800, "cache_creation_input_tokens": 400 } }
+```
+Accumulate usage across all loop iterations, emit totals on the `done` event.
+
+No new deps. The frontend uses these fields to render rich tool cards in the agent chat — collapsed by default, expanded on click. The agent side just emits the data; rendering is frontend's job.
+
+Test: run agent with `create_entity` tool call, verify `tool_call_start` has `label` and `params`. Verify `tool_call_result` has `success=True` and `duration_ms > 0`. Trigger a tool failure, verify `success=False`. Verify `done` event has `usage` with all four token fields.
+
 ---
 
 ## Phase 14: Multi-modal Input
@@ -520,6 +575,57 @@ Handle file attachments (PDF, CSV, plain text):
 The agent decides what to do with file content — create entities, summarize, extract structured data, answer questions. The original file stays in Supabase Storage, linked to any extracted entities via edges.
 
 Test: mock Supabase Storage download + Anthropic. Send a PDF attachment — verify Claude receives a `document` content block (not extracted text). Send a CSV — verify it arrives as a text block. Verify the agent can create entities from file content.
+
+---
+
+## Phase 14.5: Production Performance ✅
+
+Reduce token spend, Supabase round-trips, and improve throughput under load. All items completed.
+
+### 14.5.1 — Anthropic prompt caching ✅
+
+Add `cache_control: {type: ephemeral}` to the last tool definition in `TOOL_DEFINITIONS` (breakpoint 1). Change `build_system_prompt` to return a `list[dict]` with three blocks:
+- Block 0 (static): BASE_INSTRUCTIONS + IFRAME_BUILDER_CONTEXT, marked `ephemeral`
+- Block 1 (semi-static): space info + user profile + entity index, marked `ephemeral`
+- Block 2 (dynamic): canvas context + recent turns + temporal info, no cache_control
+
+This gives up to 4 cache breakpoints per API call (tool defs + 2 system blocks + last tool_result). Cached tokens count 0.1× toward TPM and bill at 10%.
+
+Test: verify `TOOL_DEFINITIONS[-1]` has `cache_control`. Verify `build_system_prompt` returns `list[dict]`. Verify blocks 0 and 1 have `cache_control`, block 2 does not.
+
+### 14.5.2 — Rolling tool_result cache (breakpoint 4) ✅
+
+After each tool-call iteration in `agent/loop.py`, strip `cache_control` from all prior `tool_result` message blocks, then add `cache_control: ephemeral` to only the last block of the new batch. Keeps exactly one active breakpoint 4 at all times.
+
+Test: single tool call → last result has `cache_control`. Two parallel tool calls → only the last has `cache_control`. Two loop iterations → first iteration's tool_results have no `cache_control` after second iteration appends.
+
+### 14.5.3 — In-process TTL cache ✅
+
+Module-level dict in `agent/context.py` caches Supabase query results:
+- Entity index: 60s TTL
+- User profile + space info: 300s TTL
+
+Cache is populated on first access per space/user. All context queries run concurrently via `asyncio.gather`.
+
+Test: verify cache hit avoids Supabase call on second request. Verify expiry after TTL. Verify entity index returns cached data even when Supabase mock returns nothing.
+
+### 14.5.4 — Hidden entity filter on entity index ✅
+
+`get_entity_index` now filters `.neq("presentation", "hidden")` before returning results. Excludes `conversation_turn`, `fact`, `edge`, etc. from the spatial context — they add tokens without spatial signal.
+
+Test: mock returns mix of visible and hidden entities; verify index contains none with `presentation='hidden'`.
+
+### 14.5.5 — Shared client lifespan in `main.py` ✅
+
+FastAPI `lifespan` creates Supabase + Anthropic clients **once** at startup, stores on `app.state`. The `/agent` endpoint reads from `request.app.state` rather than creating new clients per request. `config.py` exposes `set_shared_clients`, `get_shared_anthropic_client`, `get_shared_supabase_client` for modules that need clients outside the request path.
+
+Test: verify lifespan sets `app.state.supabase` and `app.state.anthropic`. Verify endpoint passes state clients to `run_agent`. Verify `acreate_client` is not called during request handling.
+
+### 14.5.6 — RateLimitError handling ✅
+
+`agent/loop.py` catches `RateLimitError` from the Anthropic SDK inside the `while True` loop. On hit: log a warning, emit `{"type": "error", "code": "rate_limit"}` SSE event, return `""` cleanly. The endpoint awaits the agent task after receiving a terminal event to drain any exception and prevent asyncio `Task exception was never retrieved` warnings.
+
+Test: `RateLimitError` emits error event with `code='rate_limit'`. Does not raise. Returns `""`.
 
 ---
 
@@ -783,6 +889,129 @@ The agent claims it can create calendar events (and other app types) but operati
 
 Test: create entities of every supported app type, verify they persist in Supabase. Intentionally trigger failures (invalid state, missing required fields), verify errors propagate back to Claude. Verify the agent communicates failures to the user instead of pretending success.
 
+### 19.5 — Tool progress events for long-running operations
+
+Add a new SSE event type for operations with meaningful internal stages:
+```json
+{ "type": "tool_progress", "id": "<tool_call_id>", "stage": "uploading", "message": "Saving image to storage" }
+```
+
+Emit from:
+- **`agent/image_gen.py`**: emit `generating` stage after Gemini call starts, `uploading` stage before Storage upload
+- **`agent/tools.py` web_search**: emit `searching` stage when Perplexity request is sent
+
+`on_event` callback already exists in `loop.py` and is passed down to `execute_tool`. Thread it through to `image_gen.py` and the web search handler so they can emit progress events. `on_event` signature stays the same — callers just pass the event dict.
+
+Test: mock Gemini + Storage, run `generate_image` with an `on_event` collector. Verify two `tool_progress` events emitted in order (`generating` then `uploading`). Mock Perplexity, run `web_search`, verify one `tool_progress` event emitted. Verify no `tool_progress` events emitted for fast tools (`create_entity`, `query_entities`).
+
+### 19.6 — Fix visible entity context **[URGENT]**
+
+`visible_entity_ids` is passed to `build_system_prompt` and through to `_build_dynamic_block`, but only used to print `"Visible: N of M entities on screen"`. The agent has no idea *which* entities the user can currently see — just a count. This is a significant context gap: the agent can't reason about what's in front of the user.
+
+Fix `_build_dynamic_block` in `agent/context.py`:
+1. Cross-reference `visible_entity_ids` against the `entities` list to get summaries for each visible entity
+2. Replace the count line with a formatted list: `- [type] id: summary` for each visible entity
+3. Exclude the focused entity (already shown above)
+
+No new queries — all data is already in the `entities` parameter passed to this function.
+
+Test: call `_build_dynamic_block` with a `visible_entity_ids` list and a matching `entities` list. Verify the output contains each visible entity's type, id, and summary. Verify the focused entity is not duplicated. Verify empty `visible_entity_ids` produces no section.
+
+### 19.7 — Recency signal in entity index
+
+The entity index is flat and unordered. The agent can't tell "this note was created 2 minutes ago in this conversation" from "this calendar has been here for months." It treats all entities equally when deciding what's relevant.
+
+1. Add `updated_at` to the `get_entity_index` select query (already fetching from entities table)
+2. In `_build_semi_static_block`: extract the 3 most recently touched entities (by `updated_at`) and list them in a `=== Recently Active ===` subsection, placed just before the full entity index
+3. Full index remains unchanged — the recency section just highlights what's hot
+
+Test: create entities with different `updated_at` values, verify the recently active section lists the correct 3. Verify the section is omitted if no entities exist.
+
+### 19.8 — Related entity hints for focused app entities
+
+When the user focuses on a `calendar`, its `calendar_event` entities are `presentation='hidden'` and don't appear in the entity index. The agent has no way to know they exist without explicitly querying. This causes the agent to say "no events found" without ever trying to fetch them.
+
+Rather than auto-injecting related data, add a lightweight type-aware hint in the canvas context section that tells the agent what to fetch:
+- focused entity is `calendar` → append: `"Tip: use query_entities(type='calendar_event') to load events for this calendar"`
+- More types added here as patterns emerge
+
+The agent decides whether to fetch. No pre-loading, no new queries.
+
+Test: build dynamic block with focused entity of type `calendar`, verify hint appears. Build with focused `note`, verify no hint. Build with no focused entity, verify no hint.
+
+### 19.9 — Session-created entity signal
+
+The agent sees the full entity index but doesn't know which entities were created in the current conversation. When the user says "update what you just made," the agent has to guess. When it creates multiple things in a session, continuity breaks.
+
+1. Add `created_at` to the `get_entity_index` select
+2. In `_build_dynamic_block`: filter entities created within the last 90 minutes and list them in a `=== Created this session ===` subsection above the recent turns section
+3. Omit the section entirely if no entities were created recently
+
+Test: seed entities with varying `created_at` timestamps. Verify entities within 90-minute window appear in the section. Verify older entities don't. Verify section is omitted when nothing recent.
+
+---
+
+## Phase 20: Google Drive Import
+
+Extend Phase 14 file processing to handle Google Workspace export formats. The frontend handles OAuth, file browsing, and download — it sends the resulting bytes to the agent as a file attachment with the correct MIME type.
+
+### 20.1 — Google Workspace MIME type handlers
+
+Extend `_build_multimodal_content()` in `agent/loop.py` (or `process_attachment` if extracted) to handle:
+
+| Google MIME type | Export format | Agent handling |
+|-----------------|--------------|----------------|
+| `application/vnd.google-apps.document` | `text/plain` or `text/html` | Same as plain text — include as text block with `[Google Doc: {filename}]` header |
+| `application/vnd.google-apps.spreadsheet` | `text/csv` | Same as CSV — include as text block with `[Google Sheet: {filename}]` header |
+| `application/vnd.google-apps.presentation` | `application/pdf` | Same as PDF — include as `document` content block (base64). Claude reads slides natively. |
+
+The frontend exports before upload: Docs → plain text, Sheets → CSV, Slides → PDF. The agent receives standard MIME types — no Google-specific SDK needed in the agent.
+
+Add `google_drive_file_id` as an optional field in the attachment payload:
+```json
+{ "type": "file", "storage_path": "...", "mime_type": "text/plain", "filename": "Report.gdoc", "google_drive_file_id": "1abc..." }
+```
+Store `google_drive_file_id` in the state of any entity the agent creates from the file, so the frontend can link back to the source.
+
+Test: send a text/plain attachment with `filename="Report.gdoc"`, verify agent receives a text block with `[Google Doc: Report.gdoc]` header. Send a CSV from a Sheet, verify same as existing CSV handling. Send a PDF from Slides, verify `document` content block. Verify `google_drive_file_id` is stored in the created entity's state when provided.
+
+---
+
+---
+
+## Phase 21: User Account Context Endpoint
+
+### 21.1 — Structured user account info for the agent
+
+**Problem:** The agent currently learns about the user (email, contacts, account details) only from what the user says in conversation. This gets extracted by compaction and stored as facts — which is unreliable, surfaces PII opportunistically, and can produce wrong inferences (e.g. linking a contact's name to their email address based on conversation context alone).
+
+**Solution:** A dedicated server-side function that builds a structured, curated account block for the agent — pulled directly from authoritative sources, never from conversation inference.
+
+#### What to build
+
+A new context fetcher `get_user_account_info(supabase, user_id)` that returns a structured dict with verified, agent-safe user data:
+
+- Display name, preferred name if set
+- Primary email (from auth provider, not from conversation)
+- Timezone, locale
+- Plan/tier
+- Connected integrations (e.g. Google Calendar connected: yes/no — not the OAuth tokens themselves)
+- Any other fields the user has explicitly set in their profile
+
+This block is injected into the semi-static context alongside `get_user_profile()`.
+
+#### Privacy constraints (non-negotiable)
+
+- **No UUIDs exposed to the agent.** The agent must never see `user_id`, `space_id`, or any internal Supabase UUID. These are internal identifiers; the agent has no legitimate use for them and exposing them risks prompt injection attacks that could target specific users.
+- **No third-party account details.** Only the authenticated user's own verified data. Contact emails, collaborator details, etc. are never included.
+- **Contacts are out of scope.** The agent may know a contact's first name from conversation but must never have their email or other identifiers injected via this system.
+
+#### Why this fixes the email fact problem
+
+Once the agent has verified email from the account block, it doesn't need to extract it from conversation — so the compaction model can be told (and the hard scrubber enforced) to never store emails as facts, because the canonical source is the account endpoint.
+
+Test: `get_user_account_info` returns correct fields, omits all UUIDs, omits OAuth tokens. Verify the account block appears in the assembled semi-static context. Verify a `user_id` UUID does not appear anywhere in the assembled prompt text.
+
 ---
 
 ## Deferred (build after above phases)
@@ -794,3 +1023,4 @@ Test: create entities of every supported app type, verify they persist in Supaba
 | Cross-space agent memory | Memory system (Phase 6) — facts that persist across spaces for the same user |
 | Agent eval suite | CI pipeline (16.1) — golden conversations, automated prompt regression testing |
 | Multi-model routing | Usage tracking (12.1) — route by complexity, cost, or user tier |
+| Knowledge graph (Phase 9) | Only if relationship queries become a real user pain point — focus hints (19.8) cover current needs |

@@ -37,14 +37,39 @@ How to run, test, and deploy the agent service. For system-wide architecture, se
 
 ## Environment Variables
 
+**Required:**
+
 | Variable | Where | Purpose |
 |----------|-------|---------|
 | `DOMUS_SERVICE_TOKEN` | Railway + Vercel | Shared secret for service-to-service auth |
 | `SUPABASE_URL` | Railway | Supabase project URL |
 | `SUPABASE_SERVICE_ROLE_KEY` | Railway | Supabase service role key (bypasses RLS for agent writes) |
 | `ANTHROPIC_API_KEY` | Railway | Claude API key |
-| `GOOGLE_API_KEY` | Railway | Gemini API key (image generation) |
-| `PERPLEXITY_API_KEY` | Railway | Perplexity API key (web search) |
+
+**Optional (features degrade gracefully when absent):**
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `GOOGLE_API_KEY` | `""` | Gemini API key — image generation disabled if missing |
+| `PERPLEXITY_API_KEY` | `""` | Perplexity API key — web search returns `unavailable` if missing |
+| `DOMUS_FRONTEND_URL` | `http://localhost:3000` | Frontend base URL for schema/tool-call proxying |
+
+**Model overrides (optional):**
+
+Set in `.env` locally or in Railway env vars to switch models without code changes.
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `AGENT_MODEL` | `claude-sonnet-4-6` | Main agent loop model |
+| `BUILDER_MODEL` | `claude-sonnet-4-6` | Declarative app builder model |
+| `IMAGE_GEN_MODEL` | `gemini-2.5-flash-image` | Gemini image generation model |
+| `COMPACTION_MODEL` | `claude-opus-4-6` | Memory compaction model |
+
+**Debug (never enable in prod):**
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `DEBUG_PROMPT_ENABLED` | `false` | Enables `POST /debug/prompt` endpoint |
 
 Store in Railway's environment variables. Local dev uses `.env`.
 
@@ -140,16 +165,52 @@ Structured JSON logs via `agent/logging.py`. Activated at startup in `main.py` v
 
 ---
 
-## Usage Tracking
+## Usage Tracking & Billing Tiers
 
-The agent service logs usage events to the `usage_events` table on every tool execution:
+`agent/usage.py` implements the full billing stack: tier resolution, quota enforcement, rate limiting, and event recording.
 
-| Event type | Trigger |
-|-----------|---------|
-| `agent_turn` | Each agent loop invocation |
-| `image_generation` | Each Gemini generate call |
-| `image_edit` | Each Gemini edit call |
-| `file_processing` | Each file sent to Claude for parsing |
-| `web_search` | Each Perplexity API call |
+### Tiers
 
-Uses the Supabase service role key (not user auth) to insert usage events.
+Resolved from `users.plan` at request time, cached 5 minutes in-process:
+
+| `users.plan` value | Resolved tier | Agent turns/day | Images/day | Searches/day | RPM |
+|--------------------|--------------|----------------|------------|--------------|-----|
+| `null` / unknown | `FREE` | 10 | 0 | 5 | 5 |
+| `'citizen'` | `CITIZEN` | 200 | 20 | 50 | 20 |
+| `'extra'` | `EXTRA` | 1000 | 100 | 200 | 60 |
+
+### Request gates (enforced in `main.py` before streaming)
+
+1. Tier resolution → `get_user_tier()`
+2. Rate limit → `check_rate_limit()` — in-memory sliding window, returns `429 + Retry-After` if over RPM
+3. Daily quota → `check_quota()` for `agent_turn` — returns `429 + resets_at` if exhausted
+
+### Recorded events
+
+| Event type | Recorded in | Notes |
+|------------|-------------|-------|
+| `agent_turn` | `loop.py` | After each Anthropic call; includes token counts |
+| `tool_call` | `tools.py` | After every `execute_tool`; includes tool name, duration, success |
+| `image_generation` | `image_gen.py` | After Gemini upload; quota also checked before call |
+| `compaction` | `memory.py` | After Opus compaction call; includes token counts |
+
+All inserts are fire-and-forget (`asyncio.create_task`). `record_usage()` never raises.
+
+### Required Supabase migration (D-2)
+
+The `usage_events` table must exist before deploying Phase 12:
+
+```sql
+CREATE TABLE usage_events (
+  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+  user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  space_id UUID NOT NULL,
+  event_type TEXT NOT NULL,
+  metadata JSONB NOT NULL DEFAULT '{}',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX usage_events_user_type_day
+  ON usage_events (user_id, event_type, created_at DESC);
+```
+
+RLS: users read own rows; service role inserts (agent uses service role key).

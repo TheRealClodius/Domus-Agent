@@ -27,9 +27,16 @@ class TestToolDefinitionsStructure:
         names = [defn["name"] for defn in TOOL_DEFINITIONS]
         expected = [
             "create_entity", "update_entity", "query_entities", "read_entity",
-            "get_entity_schema", "call_entity_tool", "build_app",
+            "get_entity_schema", "call_entity_tool", "build_app", "update_app",
+            "web_search",
         ]
         assert names == expected
+
+    def test_last_tool_definition_has_cache_control(self):
+        """TOOL_DEFINITIONS[-1] must have cache_control={'type':'ephemeral'} for Anthropic KV caching."""
+        last_tool = TOOL_DEFINITIONS[-1]
+        assert "cache_control" in last_tool
+        assert last_tool["cache_control"] == {"type": "ephemeral"}
 
     def test_each_input_schema_is_object_with_properties(self):
         for defn in TOOL_DEFINITIONS:
@@ -705,7 +712,7 @@ class TestCreateEntityImageWiring:
             {"type": "image", "state": {"generation_prompt": "a sunset"}},
         )
 
-        mock_gen.assert_called_once_with("a sunset", TEST_SPACE_ID, mock_supabase)
+        mock_gen.assert_called_once_with("a sunset", TEST_SPACE_ID, mock_supabase, TEST_USER_ID)
 
     @patch("agent.image_gen.generate_image", new_callable=AsyncMock)
     async def test_image_entity_enriches_state(self, mock_gen, mock_supabase, make_entity):
@@ -961,30 +968,6 @@ class TestComputeGroupPositions:
 
 
 # ---------------------------------------------------------------------------
-# check_batch_image_quota stub tests
-# ---------------------------------------------------------------------------
-
-
-from agent.tools import check_batch_image_quota
-
-
-class TestCheckBatchImageQuota:
-    """check_batch_image_quota is a stub that always allows."""
-
-    async def test_always_returns_allowed(self):
-        """Stub should return (True, '') for any count."""
-        allowed, reason = await check_batch_image_quota(None, "user-123", 10)
-        assert allowed is True
-        assert reason == ""
-
-    async def test_returns_tuple(self):
-        """Return type is (bool, str)."""
-        result = await check_batch_image_quota(None, "user-456", 1)
-        assert isinstance(result, tuple)
-        assert len(result) == 2
-
-
-# ---------------------------------------------------------------------------
 # Entity schema discovery and tool call handler tests
 # ---------------------------------------------------------------------------
 
@@ -1189,3 +1172,170 @@ class TestExecuteToolDispatchesNewTools:
         )
         mock_fn.assert_called_once()
         assert result["ok"] is True
+
+
+class TestWebSearch:
+    """web_search tool — definition, implementation, and dispatcher."""
+
+    def test_definition_present_in_tool_definitions(self):
+        names = [d["name"] for d in TOOL_DEFINITIONS]
+        assert "web_search" in names
+
+    def test_definition_has_required_keys(self):
+        defn = next(d for d in TOOL_DEFINITIONS if d["name"] == "web_search")
+        assert "description" in defn
+        assert "input_schema" in defn
+
+    def test_definition_requires_query(self):
+        defn = next(d for d in TOOL_DEFINITIONS if d["name"] == "web_search")
+        assert defn["input_schema"]["required"] == ["query"]
+
+    def test_definition_has_focus_enum(self):
+        defn = next(d for d in TOOL_DEFINITIONS if d["name"] == "web_search")
+        props = defn["input_schema"]["properties"]
+        assert "focus" in props
+        assert set(props["focus"]["enum"]) == {"general", "academic", "news"}
+
+    @patch("httpx.AsyncClient")
+    async def test_successful_search_returns_answer_and_citations(self, MockClient):
+        """Happy path: Perplexity returns answer + citations list."""
+        from agent.tools import web_search
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "choices": [{"message": {"content": "The answer is 42."}}],
+            "citations": ["https://example.com/source1", "https://example.com/source2"],
+        }
+
+        mock_http = AsyncMock()
+        mock_http.post.return_value = mock_resp
+        mock_http.__aenter__ = AsyncMock(return_value=mock_http)
+        mock_http.__aexit__ = AsyncMock(return_value=False)
+        MockClient.return_value = mock_http
+
+        with patch("config.PERPLEXITY_API_KEY", "pplx-test-key"):
+            result = await web_search(
+                None, TEST_SPACE_ID, TEST_USER_ID, {"query": "meaning of life"}
+            )
+
+        assert result["answer"] == "The answer is 42."
+        assert result["citations"] == [
+            {"url": "https://example.com/source1"},
+            {"url": "https://example.com/source2"},
+        ]
+
+    @patch("httpx.AsyncClient")
+    async def test_missing_api_key_returns_error(self, MockClient):
+        """When PERPLEXITY_API_KEY is empty, return unavailable error without HTTP call."""
+        from agent.tools import web_search
+
+        with patch("config.PERPLEXITY_API_KEY", ""):
+            result = await web_search(
+                None, TEST_SPACE_ID, TEST_USER_ID, {"query": "test"}
+            )
+
+        assert result["error"] == "web_search_unavailable"
+        assert "message" in result
+        MockClient.assert_not_called()
+
+    @patch("httpx.AsyncClient")
+    async def test_non_200_response_returns_error(self, MockClient):
+        """Non-200 HTTP response returns web_search_failed error with status."""
+        from agent.tools import web_search
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 429
+
+        mock_http = AsyncMock()
+        mock_http.post.return_value = mock_resp
+        mock_http.__aenter__ = AsyncMock(return_value=mock_http)
+        mock_http.__aexit__ = AsyncMock(return_value=False)
+        MockClient.return_value = mock_http
+
+        with patch("config.PERPLEXITY_API_KEY", "pplx-test-key"):
+            result = await web_search(
+                None, TEST_SPACE_ID, TEST_USER_ID, {"query": "test"}
+            )
+
+        assert result["error"] == "web_search_failed"
+        assert result["status"] == 429
+
+    @patch("httpx.AsyncClient")
+    async def test_academic_focus_uses_sonar_pro_model(self, MockClient):
+        """focus='academic' selects sonar-pro model."""
+        from agent.tools import web_search
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "choices": [{"message": {"content": "Academic answer."}}],
+            "citations": [],
+        }
+
+        mock_http = AsyncMock()
+        mock_http.post.return_value = mock_resp
+        mock_http.__aenter__ = AsyncMock(return_value=mock_http)
+        mock_http.__aexit__ = AsyncMock(return_value=False)
+        MockClient.return_value = mock_http
+
+        with patch("config.PERPLEXITY_API_KEY", "pplx-test-key"):
+            await web_search(
+                None, TEST_SPACE_ID, TEST_USER_ID,
+                {"query": "quantum entanglement", "focus": "academic"},
+            )
+
+        call_kwargs = mock_http.post.call_args[1]
+        assert call_kwargs["json"]["model"] == "sonar-pro"
+
+    @patch("httpx.AsyncClient")
+    async def test_general_focus_uses_sonar_model(self, MockClient):
+        """focus='general' (default) selects sonar model."""
+        from agent.tools import web_search
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "choices": [{"message": {"content": "General answer."}}],
+            "citations": [],
+        }
+
+        mock_http = AsyncMock()
+        mock_http.post.return_value = mock_resp
+        mock_http.__aenter__ = AsyncMock(return_value=mock_http)
+        mock_http.__aexit__ = AsyncMock(return_value=False)
+        MockClient.return_value = mock_http
+
+        with patch("config.PERPLEXITY_API_KEY", "pplx-test-key"):
+            await web_search(
+                None, TEST_SPACE_ID, TEST_USER_ID,
+                {"query": "weather today"},
+            )
+
+        call_kwargs = mock_http.post.call_args[1]
+        assert call_kwargs["json"]["model"] == "sonar"
+
+    @patch("httpx.AsyncClient")
+    async def test_execute_tool_dispatches_web_search(self, MockClient):
+        """execute_tool('web_search', ...) returns a result, not 'unknown_tool'."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "choices": [{"message": {"content": "Dispatched."}}],
+            "citations": [],
+        }
+
+        mock_http = AsyncMock()
+        mock_http.post.return_value = mock_resp
+        mock_http.__aenter__ = AsyncMock(return_value=mock_http)
+        mock_http.__aexit__ = AsyncMock(return_value=False)
+        MockClient.return_value = mock_http
+
+        with patch("config.PERPLEXITY_API_KEY", "pplx-test-key"):
+            result = await execute_tool(
+                None, "web_search", {"query": "test dispatch"},
+                TEST_SPACE_ID, TEST_USER_ID,
+            )
+
+        assert result.get("error") != "unknown_tool"
+        assert "answer" in result

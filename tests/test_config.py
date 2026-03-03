@@ -2,7 +2,8 @@
 
 import importlib
 import os
-from unittest.mock import patch
+import sys
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -67,10 +68,49 @@ class TestClientFactories:
     @pytest.mark.asyncio
     async def test_supabase_client_factory_returns_client(self):
         config = _reload_config(_VALID_ENV)
-        client = await config.acreate_client()
+        mock_client = MagicMock()
+        mock_supabase_async = MagicMock()
+        mock_supabase_async.create_client = AsyncMock(return_value=mock_client)
+        with patch.dict(sys.modules, {
+            "supabase._async": MagicMock(),
+            "supabase._async.client": mock_supabase_async,
+        }):
+            client = await config.acreate_client()
         assert client is not None
 
     def test_anthropic_client_factory_returns_client(self):
         config = _reload_config(_VALID_ENV)
         client = config.create_anthropic_client()
         assert client is not None
+
+
+class TestSharedClients:
+    """config.py must expose a shared-client singleton pattern."""
+
+    def test_get_shared_anthropic_raises_before_init(self):
+        """get_shared_anthropic_client raises RuntimeError when not yet initialized."""
+        import config
+        config._shared_anthropic_client = None
+        with pytest.raises(RuntimeError, match="not initialized"):
+            config.get_shared_anthropic_client()
+
+    def test_get_shared_supabase_raises_before_init(self):
+        """get_shared_supabase_client raises RuntimeError when not yet initialized."""
+        import config
+        config._shared_supabase_client = None
+        with pytest.raises(RuntimeError, match="not initialized"):
+            config.get_shared_supabase_client()
+
+    def test_set_and_get_shared_clients(self):
+        """set_shared_clients stores clients; getters return the same objects."""
+        import config
+        mock_a, mock_s = MagicMock(), MagicMock()
+        config.set_shared_clients(mock_a, mock_s)
+        assert config.get_shared_anthropic_client() is mock_a
+        assert config.get_shared_supabase_client() is mock_s
+
+    def test_anthropic_client_has_timeout(self):
+        """create_anthropic_client must configure an httpx Timeout."""
+        config = _reload_config(_VALID_ENV)
+        client = config.create_anthropic_client()
+        assert client.timeout is not None

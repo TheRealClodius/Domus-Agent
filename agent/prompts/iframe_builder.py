@@ -71,7 +71,7 @@ Apps fill their window. Always start with:
 - Header + scrollable body: header is sticky/fixed, body is `flex-1 overflow-auto`
 - Grid of items: `grid grid-cols-2 gap-3 p-4` or `grid grid-cols-3 gap-2 p-4`
 - List of items: `flex flex-col gap-2 p-4`
-- Split panel: `flex h-full` with sidebar + main area
+- Split panel: `flex h-full` with left panel + main area
 
 **Sizing:** Apps render in windows typically 480×560px. Design for that size but use
 flex/grid so they scale when the user resizes the window.

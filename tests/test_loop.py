@@ -447,6 +447,7 @@ class TestMultiTurnAgent:
             {"type": "note", "state": {"title": "My Note"}},
             TEST_SPACE_ID,
             TEST_USER_ID,
+            tier=None,
         )
 
     @patch("agent.loop.build_system_prompt", new_callable=AsyncMock, return_value="test prompt")
@@ -1024,3 +1025,296 @@ class TestLoopLogging:
         # Should have at least one log line from the agent loop
         agent_logs = [l for l in log_lines if l.get("logger", "").startswith("agent.")]
         assert len(agent_logs) >= 1, f"Expected agent.* log lines, got: {log_lines}"
+
+
+# ---------------------------------------------------------------------------
+# Production improvements — prompt caching, model, rate limits, usage logging
+# ---------------------------------------------------------------------------
+
+_MOCK_BLOCKS = [
+    {"type": "text", "text": "base instructions", "cache_control": {"type": "ephemeral"}},
+    {"type": "text", "text": "entity index", "cache_control": {"type": "ephemeral"}},
+    {"type": "text", "text": "dynamic context"},
+]
+
+
+class TestModelVersion:
+    """loop.py must use cfg.AGENT_MODEL."""
+
+    @patch("agent.loop.build_system_prompt", new_callable=AsyncMock, return_value=_MOCK_BLOCKS)
+    async def test_model_comes_from_config(self, mock_prompt, mock_supabase):
+        """Claude API must be called with the model from cfg.AGENT_MODEL."""
+        import config as cfg
+        mock_supabase.set_table_response("entities", [])
+        mock_anthropic = MagicMock()
+        mock_anthropic.messages.create = AsyncMock(
+            return_value=_make_text_response("Hi!")
+        )
+
+        await run_agent(
+            mock_supabase, mock_anthropic, TEST_SPACE_ID, TEST_USER_ID, "Hello"
+        )
+
+        call_kwargs = mock_anthropic.messages.create.call_args.kwargs
+        assert call_kwargs["model"] == cfg.AGENT_MODEL
+
+
+class TestSystemAsBlocks:
+    """loop.py must pass build_system_prompt's list directly to the system kwarg."""
+
+    @patch("agent.loop.build_system_prompt", new_callable=AsyncMock, return_value=_MOCK_BLOCKS)
+    async def test_system_passed_as_list_of_blocks(self, mock_prompt, mock_supabase):
+        """system kwarg must be a list (the blocks from build_system_prompt)."""
+        mock_supabase.set_table_response("entities", [])
+        mock_anthropic = MagicMock()
+        mock_anthropic.messages.create = AsyncMock(
+            return_value=_make_text_response("Hi!")
+        )
+
+        await run_agent(
+            mock_supabase, mock_anthropic, TEST_SPACE_ID, TEST_USER_ID, "Hello"
+        )
+
+        call_kwargs = mock_anthropic.messages.create.call_args.kwargs
+        assert isinstance(call_kwargs["system"], list)
+        assert call_kwargs["system"] == _MOCK_BLOCKS
+
+
+class TestToolResultCaching:
+    """After each tool-call batch, the last tool_result block gets cache_control=ephemeral.
+    Prior iterations' cache_control is stripped so only one breakpoint stays active."""
+
+    @patch("agent.loop.build_system_prompt", new_callable=AsyncMock, return_value=_MOCK_BLOCKS)
+    @patch("agent.loop.execute_tool", new_callable=AsyncMock,
+           return_value={"id": "e-1", "type": "note"})
+    async def test_last_tool_result_has_cache_control(
+        self, mock_execute, mock_prompt, mock_supabase
+    ):
+        """After one tool call, the tool_result block must have cache_control=ephemeral."""
+        mock_supabase.set_table_response("entities", [_make_entity(
+            entity_type="conversation_turn", presentation="hidden",
+            state={"role": "user", "content": "Create a note"}, created_by="agent",
+        )])
+
+        captured_messages = []
+
+        async def capture_create(**kwargs):
+            captured_messages.append(kwargs.get("messages", []))
+            return _make_text_response("Done!")
+
+        mock_anthropic = MagicMock()
+        mock_anthropic.messages.create = AsyncMock(side_effect=[
+            _make_tool_response("create_entity", "tool_1", {"type": "note"}),
+            # second call capture
+        ])
+        # Override to capture the second call's messages
+        call_count = 0
+        responses = [
+            _make_tool_response("create_entity", "tool_1", {"type": "note"}),
+            _make_text_response("Done!"),
+        ]
+        all_call_messages = []
+
+        async def side_effect(**kwargs):
+            all_call_messages.append(kwargs.get("messages", []))
+            nonlocal call_count
+            r = responses[call_count]
+            call_count += 1
+            return r
+
+        mock_anthropic.messages.create = AsyncMock(side_effect=side_effect)
+
+        await run_agent(
+            mock_supabase, mock_anthropic, TEST_SPACE_ID, TEST_USER_ID,
+            "Create a note",
+        )
+
+        # Second Claude call — messages[2] is the tool_results message
+        second_call_messages = all_call_messages[1]
+        tool_results_msg = second_call_messages[2]
+        last_block = tool_results_msg["content"][-1]
+        assert last_block.get("cache_control") == {"type": "ephemeral"}
+
+    @patch("agent.loop.build_system_prompt", new_callable=AsyncMock, return_value=_MOCK_BLOCKS)
+    @patch("agent.loop.execute_tool", new_callable=AsyncMock,
+           return_value={"id": "e-1", "type": "note"})
+    async def test_only_last_of_multiple_tool_results_is_cached(
+        self, mock_execute, mock_prompt, mock_supabase
+    ):
+        """With 2 parallel tool calls, only the last tool_result block gets cache_control."""
+        mock_supabase.set_table_response("entities", [_make_entity(
+            entity_type="conversation_turn", presentation="hidden",
+            state={"role": "user", "content": "do stuff"}, created_by="agent",
+        )])
+
+        call_count = 0
+        responses = [
+            _make_multi_tool_response([
+                ("create_entity", "t1", {"type": "note"}),
+                ("create_entity", "t2", {"type": "note"}),
+            ]),
+            _make_text_response("Done!"),
+        ]
+        all_call_messages = []
+
+        async def side_effect(**kwargs):
+            all_call_messages.append(kwargs.get("messages", []))
+            nonlocal call_count
+            r = responses[call_count]
+            call_count += 1
+            return r
+
+        mock_anthropic = MagicMock()
+        mock_anthropic.messages.create = AsyncMock(side_effect=side_effect)
+
+        await run_agent(
+            mock_supabase, mock_anthropic, TEST_SPACE_ID, TEST_USER_ID, "do stuff",
+        )
+
+        second_call_messages = all_call_messages[1]
+        tool_results_msg = second_call_messages[2]
+        blocks = tool_results_msg["content"]
+        assert len(blocks) == 2
+        # Only last block has cache_control
+        assert "cache_control" not in blocks[0]
+        assert blocks[-1].get("cache_control") == {"type": "ephemeral"}
+
+    @patch("agent.loop.build_system_prompt", new_callable=AsyncMock, return_value=_MOCK_BLOCKS)
+    @patch("agent.loop.execute_tool", new_callable=AsyncMock,
+           return_value={"id": "e-1", "type": "note"})
+    async def test_previous_iteration_cache_control_stripped(
+        self, mock_execute, mock_prompt, mock_supabase
+    ):
+        """On the 3rd Claude call, the first iteration's tool_result cache_control is stripped."""
+        mock_supabase.set_table_response("entities", [_make_entity(
+            entity_type="conversation_turn", presentation="hidden",
+            state={"role": "user", "content": "multi"}, created_by="agent",
+        )])
+
+        call_count = 0
+        responses = [
+            _make_tool_response("create_entity", "t1", {"type": "note"}),
+            _make_tool_response("create_entity", "t2", {"type": "note"}),
+            _make_text_response("All done!"),
+        ]
+        all_call_messages = []
+
+        async def side_effect(**kwargs):
+            all_call_messages.append(kwargs.get("messages", []))
+            nonlocal call_count
+            r = responses[call_count]
+            call_count += 1
+            return r
+
+        mock_anthropic = MagicMock()
+        mock_anthropic.messages.create = AsyncMock(side_effect=side_effect)
+
+        await run_agent(
+            mock_supabase, mock_anthropic, TEST_SPACE_ID, TEST_USER_ID, "multi",
+        )
+
+        # Third call: messages = [user, asst1, tool1, asst2, tool2]
+        # First iteration's tool_result is messages[2] — cache_control must be stripped
+        third_call_messages = all_call_messages[2]
+        first_tool_results_msg = third_call_messages[2]
+        for block in first_tool_results_msg["content"]:
+            assert "cache_control" not in block, (
+                f"Previous iteration tool_result should not have cache_control: {block}"
+            )
+        # Second iteration's tool_result is messages[4] — still has cache_control
+        second_tool_results_msg = third_call_messages[4]
+        assert second_tool_results_msg["content"][-1].get("cache_control") == {
+            "type": "ephemeral"
+        }
+
+
+class TestRateLimitHandling:
+    """RateLimitError must be caught, surfaced as an error event, and not re-raised."""
+
+    @patch("agent.loop.build_system_prompt", new_callable=AsyncMock, return_value=_MOCK_BLOCKS)
+    async def test_rate_limit_emits_error_event_with_code(self, mock_prompt, mock_supabase):
+        """When the API is rate-limited, emit {type:'error', code:'rate_limit'} and return ''."""
+        from anthropic import RateLimitError
+
+        mock_supabase.set_table_response("entities", [])
+        mock_response = MagicMock()
+        mock_response.status_code = 429
+        mock_response.headers = {}
+        mock_response.request = MagicMock()
+
+        error = RateLimitError("rate limited", response=mock_response, body={})
+
+        mock_anthropic = MagicMock()
+        mock_anthropic.messages.create = AsyncMock(side_effect=error)
+
+        events = []
+
+        async def collect(e):
+            events.append(e)
+
+        result = await run_agent(
+            mock_supabase, mock_anthropic, TEST_SPACE_ID, TEST_USER_ID,
+            "Hello", on_event=collect,
+        )
+
+        assert result == ""
+        assert any(e.get("code") == "rate_limit" for e in events)
+
+    @patch("agent.loop.build_system_prompt", new_callable=AsyncMock, return_value=_MOCK_BLOCKS)
+    async def test_rate_limit_does_not_raise(self, mock_prompt, mock_supabase):
+        """RateLimitError must not propagate — run_agent returns '' cleanly."""
+        from anthropic import RateLimitError
+
+        mock_supabase.set_table_response("entities", [])
+        mock_response = MagicMock()
+        mock_response.status_code = 429
+        mock_response.headers = {}
+        mock_response.request = MagicMock()
+
+        error = RateLimitError("rate limited", response=mock_response, body={})
+
+        mock_anthropic = MagicMock()
+        mock_anthropic.messages.create = AsyncMock(side_effect=error)
+
+        # Must not raise
+        result = await run_agent(
+            mock_supabase, mock_anthropic, TEST_SPACE_ID, TEST_USER_ID, "Hello"
+        )
+        assert result == ""
+
+
+class TestTokenUsageLogging:
+    """Token usage must be logged after each Claude API call."""
+
+    @patch("agent.loop.build_system_prompt", new_callable=AsyncMock, return_value=_MOCK_BLOCKS)
+    async def test_token_usage_logged_after_claude_call(
+        self, mock_prompt, mock_supabase, caplog
+    ):
+        """logger.info must be called with 'anthropic_token_usage' after each Claude call."""
+        import logging
+
+        mock_supabase.set_table_response("entities", [_make_entity(
+            entity_type="conversation_turn", presentation="hidden",
+            state={"role": "user", "content": "Hi"}, created_by="agent",
+        )])
+
+        response = _make_text_response("Hello!")
+        usage = MagicMock()
+        usage.input_tokens = 100
+        usage.output_tokens = 50
+        usage.cache_creation_input_tokens = 0
+        usage.cache_read_input_tokens = 0
+        response.usage = usage
+
+        mock_anthropic = MagicMock()
+        mock_anthropic.messages.create = AsyncMock(return_value=response)
+
+        with caplog.at_level(logging.INFO, logger="agent.loop"):
+            await run_agent(
+                mock_supabase, mock_anthropic, TEST_SPACE_ID, TEST_USER_ID, "Hi"
+            )
+
+        assert any(
+            "anthropic_token_usage" in record.message
+            for record in caplog.records
+        )
