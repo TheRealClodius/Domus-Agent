@@ -45,6 +45,10 @@ DEBUG_PROMPT_ENABLED: bool = os.getenv("DEBUG_PROMPT_ENABLED", "false").lower() 
 # state machine and POSTs results back to /agent/action-result.
 UI_ACTION_MIRRORING: bool = os.getenv("UI_ACTION_MIRRORING", "false").lower() == "true"
 
+# Timeout (seconds) for frontend to respond to a ui_action before falling
+# back to direct server-side execution.
+UI_ACTION_TIMEOUT_SECONDS: float = float(os.getenv("UI_ACTION_TIMEOUT_SECONDS", "15.0"))
+
 # ---------------------------------------------------------------------------
 # Billing tier limits (daily quotas per event_type)
 # ---------------------------------------------------------------------------

@@ -79,3 +79,63 @@ async def test_wait_for_unknown_action():
     bridge = ActionBridge()
     result = await bridge.wait_for_result("act_doesnt_exist", timeout=1.0)
     assert result["error"] == "unknown_action"
+
+
+# ---------------------------------------------------------------------------
+# Edge case tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_late_resolve_after_timeout():
+    """After timeout, a late resolve() is a no-op (returns False)."""
+    bridge = ActionBridge()
+    pa = bridge.create_action("update_entity", {"id": "ent_1"})
+
+    result = await bridge.wait_for_result(pa.action_id, timeout=0.01)
+    assert result["error"] == "ui_action_timeout"
+
+    # Late resolve should be no-op — action was cleaned up
+    assert bridge.resolve(pa.action_id, {"success": True}) is False
+
+
+@pytest.mark.asyncio
+async def test_cancel_then_resolve():
+    """After cancel(), resolve() returns False."""
+    bridge = ActionBridge()
+    pa = bridge.create_action("create_entity", {"type": "note"})
+
+    bridge.cancel(pa.action_id)
+    assert bridge.resolve(pa.action_id, {"success": True}) is False
+
+
+@pytest.mark.asyncio
+async def test_cancel_then_wait_returns_unknown():
+    """After cancel(), wait_for_result returns unknown_action."""
+    bridge = ActionBridge()
+    pa = bridge.create_action("create_entity", {"type": "note"})
+
+    bridge.cancel(pa.action_id)
+    result = await bridge.wait_for_result(pa.action_id, timeout=1.0)
+    assert result["error"] == "unknown_action"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_actions_in_same_bridge():
+    """Multiple actions in the same bridge resolve independently."""
+    bridge = ActionBridge()
+    pa1 = bridge.create_action("create_entity", {"type": "note"})
+    pa2 = bridge.create_action("update_entity", {"id": "ent_1"})
+
+    async def resolve_both():
+        await asyncio.sleep(0.01)
+        bridge.resolve(pa1.action_id, {"success": True, "result": {"id": "a"}})
+        bridge.resolve(pa2.action_id, {"success": True, "result": {"id": "b"}})
+
+    asyncio.create_task(resolve_both())
+    r1, r2 = await asyncio.gather(
+        bridge.wait_for_result(pa1.action_id, timeout=1.0),
+        bridge.wait_for_result(pa2.action_id, timeout=1.0),
+    )
+    assert r1["result"]["id"] == "a"
+    assert r2["result"]["id"] == "b"

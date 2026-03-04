@@ -3,6 +3,7 @@
 import asyncio
 import json
 import time
+from uuid import uuid4
 
 from anthropic import RateLimitError
 
@@ -216,6 +217,8 @@ async def run_agent(
         async def on_event(event):
             pass
 
+    turn_id = f"turn_{uuid4().hex[:12]}"
+
     # UI action mirroring — create bridge if enabled
     bridge = None
     if cfg.UI_ACTION_MIRRORING:
@@ -225,7 +228,8 @@ async def run_agent(
 
     logger.info(
         "agent_turn_start",
-        extra={"space_id": space_id, "user_id": user_id, "user_timezone": user_timezone},
+        extra={"space_id": space_id, "user_id": user_id,
+               "user_timezone": user_timezone, "turn_id": turn_id},
     )
 
     # Build system prompt (returns list of cacheable blocks)
@@ -355,6 +359,7 @@ async def run_agent(
                 result = await execute_tool(
                     client, tc.name, params, space_id, user_id,
                     tier=tier, bridge=bridge, on_event=on_event,
+                    turn_id=turn_id,
                 )
                 ms = (time.monotonic() - t) * 1000
                 log_tool_execution(logger, tc.name, ms, space_id=space_id, user_id=user_id)

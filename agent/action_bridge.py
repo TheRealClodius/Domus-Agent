@@ -53,6 +53,13 @@ class ActionBridge:
         self._pending.pop(action_id, None)
 
     async def wait_for_result(self, action_id: str, timeout: float = 15.0) -> dict:
+        """Wait for a pending action to be resolved or time out.
+
+        Note: the agent loop awaits action.future directly instead of this
+        method, because resolve() can fire synchronously during on_event
+        before this lookup runs. This method is used by tests and the
+        callback endpoint.
+        """
         pa = self._pending.get(action_id)
         if pa is None:
             return {"error": "unknown_action", "action_id": action_id}

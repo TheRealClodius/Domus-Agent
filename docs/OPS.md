@@ -65,6 +65,13 @@ Set in `.env` locally or in Railway env vars to switch models without code chang
 | `IMAGE_GEN_MODEL` | `gemini-2.5-flash-image` | Gemini image generation model |
 | `COMPACTION_MODEL` | `claude-opus-4-6` | Memory compaction model |
 
+**Feature flags:**
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `UI_ACTION_MIRRORING` | `false` | Route visible entity mutations through frontend UI state machine |
+| `UI_ACTION_TIMEOUT_SECONDS` | `15.0` | Seconds to wait for frontend callback before falling back to direct execution |
+
 **Debug (never enable in prod):**
 
 | Variable | Default | Purpose |

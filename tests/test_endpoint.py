@@ -478,3 +478,52 @@ class TestActionResultEndpoint:
             assert resp.status_code == 404
         finally:
             unregister_bridge(TEST_SPACE_ID, TEST_USER_ID)
+
+    async def test_wrong_space_returns_404(self, client):
+        """Callback with wrong space_id gets 404 even if action_id is valid."""
+        from agent.action_bridge import ActionBridge, register_bridge, unregister_bridge
+
+        bridge = ActionBridge()
+        pa = bridge.create_action("create_entity", {"type": "note"})
+        register_bridge("space_correct", "user_correct", bridge)
+
+        try:
+            resp = await client.post(
+                "/agent/action-result",
+                json={
+                    "action_id": pa.action_id,
+                    "space_id": "space_wrong",
+                    "user_id": "user_correct",
+                    "success": True,
+                },
+                headers={"Authorization": "Bearer test-token"},
+            )
+            assert resp.status_code == 404
+        finally:
+            unregister_bridge("space_correct", "user_correct")
+
+    async def test_duplicate_callback_returns_404(self, client):
+        """Second resolve on the same action_id returns 404."""
+        from agent.action_bridge import ActionBridge, register_bridge, unregister_bridge
+
+        bridge = ActionBridge()
+        pa = bridge.create_action("create_entity", {"type": "note"})
+        register_bridge(TEST_SPACE_ID, TEST_USER_ID, bridge)
+
+        try:
+            payload = {
+                "action_id": pa.action_id,
+                "space_id": TEST_SPACE_ID,
+                "user_id": TEST_USER_ID,
+                "success": True,
+                "result": {"id": "ent_1"},
+            }
+            headers = {"Authorization": "Bearer test-token"}
+
+            first = await client.post("/agent/action-result", json=payload, headers=headers)
+            assert first.status_code == 200
+
+            second = await client.post("/agent/action-result", json=payload, headers=headers)
+            assert second.status_code == 404
+        finally:
+            unregister_bridge(TEST_SPACE_ID, TEST_USER_ID)
