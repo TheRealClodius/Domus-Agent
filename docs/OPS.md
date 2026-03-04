@@ -6,7 +6,7 @@ How to run, test, and deploy the agent service. For system-wide architecture, se
 
 ## Runtime
 
-- **Python:** 3.11+ (floor set by NetworkX 3.6)
+- **Python:** 3.11+
 - **Framework:** FastAPI + Uvicorn
 - **Deploy:** Railway (persistent process, not serverless)
 
@@ -31,7 +31,8 @@ How to run, test, and deploy the agent service. For system-wide architecture, se
 
 | Package | Version | Purpose |
 |---------|---------|---------|
-| `pytest` | >=9.0 | Test runner (async support) |
+| `pytest` | >=9.0 | Test runner |
+| `pytest-asyncio` | >=0.25 | Async test support (`@pytest.mark.asyncio`) |
 
 ---
 
