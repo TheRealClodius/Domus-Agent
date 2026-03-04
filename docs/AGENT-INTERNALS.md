@@ -257,7 +257,7 @@ This prevents the frontend from rendering memory/system entities as visible card
 
 ### Quota enforcement in `execute_tool`
 
-`execute_tool(client, name, params, space_id, user_id, tier=None)` enforces per-tool quotas when `tier` is provided:
+`execute_tool(client, name, params, space_id, user_id, tier=None, bridge=None, on_event=None, turn_id=None)` enforces per-tool quotas when `tier` is provided:
 
 - **image generation:** before calling `create_entity` with `type='image'` and `state.generation_prompt` present, checks `check_quota(..., "image_generation")`. If exhausted, returns `{"error": "quota_exhausted", ...}` — Gemini is never called.
 - **web search:** before calling `web_search`, checks `check_quota(..., "web_search")`. Same short-circuit.
@@ -403,21 +403,6 @@ Calls Perplexity API (`POST https://api.perplexity.ai/chat/completions`) via `ht
 ```
 
 **Key missing:** If `PERPLEXITY_API_KEY` is empty, returns `web_search_unavailable` immediately — no HTTP call is made.
-
----
-
-## Knowledge Graph (`graph/`)
-
-Relationships between entities are stored as entities themselves (`type='edge'`, `presentation='hidden'`).
-
-**`graph/store.py`** — Adjacency list using edge entities in the entities table.
-
-**`graph/ops.py`** — NetworkX operations loaded on-demand from edge entities:
-- `build_graph(edges)` → `nx.DiGraph`
-- `related_entities(G, entity_id, depth=2)` → BFS traversal
-- `find_clusters(G)` → strongly connected components
-
-The agent queries edges on demand via `query_entities(type='edge')`. Graph context is not pre-loaded.
 
 ---
 
