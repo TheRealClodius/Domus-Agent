@@ -1573,3 +1573,164 @@ class TestEntityIndexCacheInvalidation:
                                    {"entity_id": "ent-1", "tool_name": "do_thing"})
 
         mock_inv.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# UI Action Mirroring — execute_tool with bridge
+# ---------------------------------------------------------------------------
+
+
+class TestExecuteToolWithBridge:
+    """Test execute_tool behaviour when an ActionBridge is provided."""
+
+    @pytest.mark.asyncio
+    @patch("agent.loop._bg")
+    async def test_emits_ui_action_for_create_entity(self, _mock_bg):
+        """When bridge is active, create_entity emits a ui_action event."""
+        from agent.action_bridge import ActionBridge
+
+        bridge = ActionBridge()
+        events = []
+
+        async def on_event(e):
+            events.append(e)
+            if e.get("type") == "ui_action":
+                bridge.resolve(e["action_id"], {
+                    "success": True,
+                    "result": {"id": "ent_new", "type": "note"},
+                })
+
+        result = await execute_tool(
+            None, "create_entity", {"type": "note", "content": "hello"},
+            TEST_SPACE_ID, TEST_USER_ID,
+            bridge=bridge, on_event=on_event,
+        )
+
+        ui_actions = [e for e in events if e["type"] == "ui_action"]
+        assert len(ui_actions) == 1
+        assert ui_actions[0]["action"] == "create_entity"
+        assert result == {"id": "ent_new", "type": "note"}
+
+    @pytest.mark.asyncio
+    @patch("agent.loop._bg")
+    async def test_bridge_skips_internal_types(self, _mock_bg):
+        """Internal types (conversation_turn) bypass mirroring even with bridge."""
+        from agent.action_bridge import ActionBridge
+
+        client = MockSupabaseClient()
+        turn_row = _make_entity(entity_type="conversation_turn")
+        client.set_table_response("entities", [turn_row])
+
+        bridge = ActionBridge()
+        events = []
+
+        async def on_event(e):
+            events.append(e)
+
+        result = await execute_tool(
+            client, "create_entity",
+            {"type": "conversation_turn", "state": {"role": "user", "content": "hi"}},
+            TEST_SPACE_ID, TEST_USER_ID,
+            bridge=bridge, on_event=on_event,
+        )
+
+        ui_actions = [e for e in events if e.get("type") == "ui_action"]
+        assert len(ui_actions) == 0
+        assert "error" not in result
+
+    @pytest.mark.asyncio
+    @patch("agent.loop._bg")
+    async def test_bridge_timeout_falls_back_to_direct(self, _mock_bg):
+        """When frontend doesn't respond, falls back to direct execution."""
+        from agent.action_bridge import ActionBridge
+
+        bridge = ActionBridge()
+        events = []
+
+        async def on_event(e):
+            events.append(e)
+
+        original_wait = bridge.wait_for_result
+
+        async def fast_timeout(action_id, timeout=15.0):
+            return await original_wait(action_id, timeout=0.01)
+
+        bridge.wait_for_result = fast_timeout
+
+        client = MockSupabaseClient()
+        entity = _make_entity(entity_type="note")
+        client.set_table_response("entities", [entity])
+
+        with patch("httpx.AsyncClient") as MockClient:
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.json.return_value = entity
+            mock_http = AsyncMock()
+            mock_http.__aenter__ = AsyncMock(return_value=mock_http)
+            mock_http.__aexit__ = AsyncMock(return_value=False)
+            mock_http.post = AsyncMock(return_value=mock_resp)
+            MockClient.return_value = mock_http
+
+            with patch("config.DOMUS_FRONTEND_URL", "http://test:3000"), \
+                 patch("config.DOMUS_SERVICE_TOKEN", "tok"):
+                result = await execute_tool(
+                    client, "create_entity", {"type": "note", "content": "test"},
+                    TEST_SPACE_ID, TEST_USER_ID,
+                    bridge=bridge, on_event=on_event,
+                )
+
+        ui_actions = [e for e in events if e.get("type") == "ui_action"]
+        assert len(ui_actions) == 1
+        assert "error" not in result
+
+    @pytest.mark.asyncio
+    @patch("agent.loop._bg")
+    async def test_no_bridge_unchanged_behavior(self, _mock_bg):
+        """Without bridge, execute_tool behaves exactly as before."""
+        client = MockSupabaseClient()
+        entity = _make_entity(entity_type="note")
+        client.set_table_response("entities", [entity])
+
+        with patch("httpx.AsyncClient") as MockClient:
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.json.return_value = entity
+            mock_http = AsyncMock()
+            mock_http.__aenter__ = AsyncMock(return_value=mock_http)
+            mock_http.__aexit__ = AsyncMock(return_value=False)
+            mock_http.post = AsyncMock(return_value=mock_resp)
+            MockClient.return_value = mock_http
+
+            with patch("config.DOMUS_FRONTEND_URL", "http://test:3000"), \
+                 patch("config.DOMUS_SERVICE_TOKEN", "tok"):
+                result = await execute_tool(
+                    client, "create_entity", {"type": "note", "content": "test"},
+                    TEST_SPACE_ID, TEST_USER_ID,
+                    bridge=None, on_event=None,
+                )
+
+        assert "error" not in result
+
+    @pytest.mark.asyncio
+    @patch("agent.loop._bg")
+    async def test_frontend_error_propagated(self, _mock_bg):
+        """When frontend responds with success=False, error is propagated."""
+        from agent.action_bridge import ActionBridge
+
+        bridge = ActionBridge()
+
+        async def on_event(e):
+            if e.get("type") == "ui_action":
+                bridge.resolve(e["action_id"], {
+                    "success": False,
+                    "error": "folder_has_children",
+                })
+
+        result = await execute_tool(
+            None, "update_entity", {"id": "ent_1", "state": {"archived": True}},
+            TEST_SPACE_ID, TEST_USER_ID,
+            bridge=bridge, on_event=on_event,
+        )
+
+        assert result["error"] == "ui_action_failed"
+        assert result["message"] == "folder_has_children"

@@ -401,3 +401,80 @@ class TestConcurrentTurnLimit:
             assert data["error"] == "concurrent_limit"
         finally:
             await release_turn_slot(user_id)
+
+
+class TestActionResultEndpoint:
+    """POST /agent/action-result — UI action callback from frontend."""
+
+    async def test_requires_auth(self, client):
+        resp = await client.post(
+            "/agent/action-result",
+            json={
+                "action_id": "act_123",
+                "space_id": TEST_SPACE_ID,
+                "user_id": TEST_USER_ID,
+                "success": True,
+                "result": {"id": "ent_1"},
+            },
+        )
+        assert resp.status_code == 401
+
+    async def test_no_active_bridge_returns_404(self, client):
+        resp = await client.post(
+            "/agent/action-result",
+            json={
+                "action_id": "act_123",
+                "space_id": TEST_SPACE_ID,
+                "user_id": TEST_USER_ID,
+                "success": True,
+                "result": {"id": "ent_1"},
+            },
+            headers={"Authorization": "Bearer test-token"},
+        )
+        assert resp.status_code == 404
+
+    async def test_resolves_pending_action(self, client):
+        from agent.action_bridge import ActionBridge, register_bridge, unregister_bridge
+
+        bridge = ActionBridge()
+        pa = bridge.create_action("create_entity", {"type": "note"})
+        register_bridge(TEST_SPACE_ID, TEST_USER_ID, bridge)
+
+        try:
+            resp = await client.post(
+                "/agent/action-result",
+                json={
+                    "action_id": pa.action_id,
+                    "space_id": TEST_SPACE_ID,
+                    "user_id": TEST_USER_ID,
+                    "success": True,
+                    "result": {"id": "ent_new"},
+                },
+                headers={"Authorization": "Bearer test-token"},
+            )
+            assert resp.status_code == 200
+            assert resp.json() == {"ok": True}
+            assert pa.future.done()
+        finally:
+            unregister_bridge(TEST_SPACE_ID, TEST_USER_ID)
+
+    async def test_unknown_action_id_returns_404(self, client):
+        from agent.action_bridge import ActionBridge, register_bridge, unregister_bridge
+
+        bridge = ActionBridge()
+        register_bridge(TEST_SPACE_ID, TEST_USER_ID, bridge)
+
+        try:
+            resp = await client.post(
+                "/agent/action-result",
+                json={
+                    "action_id": "act_nonexistent",
+                    "space_id": TEST_SPACE_ID,
+                    "user_id": TEST_USER_ID,
+                    "success": True,
+                },
+                headers={"Authorization": "Bearer test-token"},
+            )
+            assert resp.status_code == 404
+        finally:
+            unregister_bridge(TEST_SPACE_ID, TEST_USER_ID)

@@ -339,18 +339,16 @@ _INTERNAL_TYPES = {
 }
 
 
-async def create_entity(client, space_id: str, user_id: str, params: dict) -> dict:
-    """Create a new entity. Internal types insert directly to Supabase (presentation=hidden).
-    User-facing types POST to the Next.js API. Always sets created_by='agent'.
+async def _preprocess_create(client, space_id: str, user_id: str, params: dict) -> dict:
+    """Pre-process create_entity params: run image generation if needed.
 
-    For image entities with state.generation_prompt, automatically generates
-    the image via Gemini and enriches the state with image_url, width, height
-    before forwarding to the frontend.
+    Returns a new params dict with enriched state (image_url, width, height).
+    This runs server-side before either direct write or UI action mirroring.
     """
+    params = dict(params)
     entity_type = params.get("type", "note")
     state = dict(params.get("state") or {})
 
-    # Image generation: type='image' + generation_prompt (or prompt) triggers Gemini pipeline
     if "prompt" in state and "generation_prompt" not in state:
         state["generation_prompt"] = state.pop("prompt")
     if entity_type == "image" and "generation_prompt" in state:
@@ -369,6 +367,22 @@ async def create_entity(client, space_id: str, user_id: str, params: dict) -> di
                 extra={"space_id": space_id, "error": str(e)},
             )
             state["generation_error"] = str(e)[:200]
+
+    params["state"] = state
+    return params
+
+
+async def create_entity(client, space_id: str, user_id: str, params: dict) -> dict:
+    """Create a new entity. Internal types insert directly to Supabase (presentation=hidden).
+    User-facing types POST to the Next.js API. Always sets created_by='agent'.
+
+    For image entities with state.generation_prompt, automatically generates
+    the image via Gemini and enriches the state with image_url, width, height
+    before forwarding to the frontend.
+    """
+    params = await _preprocess_create(client, space_id, user_id, params)
+    entity_type = params.get("type", "note")
+    state = dict(params.get("state") or {})
 
     if entity_type in _INTERNAL_TYPES:
         row: dict = {
@@ -601,8 +615,12 @@ def compute_group_positions(count: int, viewport: dict | None = None) -> list[di
 # ---------------------------------------------------------------------------
 
 
-async def build_app(client, space_id: str, user_id: str, params: dict) -> dict:
-    """Create a generated app entity with React code, schema, and initial state."""
+def _preprocess_build_app(params: dict) -> dict:
+    """Assemble the full entity row dict from build_app params.
+
+    Returns a dict with type, state, position, size, etc. ready for either
+    direct Supabase insert or UI action mirroring.
+    """
     state = {
         "_code": params["code"],
         "_schema": params["schema"],
@@ -613,10 +631,7 @@ async def build_app(client, space_id: str, user_id: str, params: dict) -> dict:
         },
         **params.get("initial_state", {}),
     }
-
-    row = {
-        "space_id": space_id,
-        "user_id": user_id,
+    return {
         "type": "app",
         "content": "",
         "presentation": "window",
@@ -629,6 +644,13 @@ async def build_app(client, space_id: str, user_id: str, params: dict) -> dict:
         "summary": params["name"],
         "created_by": "agent",
     }
+
+
+async def build_app(client, space_id: str, user_id: str, params: dict) -> dict:
+    """Create a generated app entity with React code, schema, and initial state."""
+    row = _preprocess_build_app(params)
+    row["space_id"] = space_id
+    row["user_id"] = user_id
 
     result = await client.table("entities").insert(row).execute()
     entity = result.data[0] if result.data else row
@@ -716,8 +738,12 @@ async def web_search(client, space_id: str, user_id: str, params: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
+_MIRRORED_TOOLS = {"create_entity", "update_entity", "build_app", "update_app"}
+
+
 async def execute_tool(
-    client, name: str, params: dict, space_id: str, user_id: str, tier=None
+    client, name: str, params: dict, space_id: str, user_id: str,
+    tier=None, bridge=None, on_event=None,
 ) -> dict:
     """Dispatch a tool call by name. Returns the tool result or an error dict.
 
@@ -725,8 +751,14 @@ async def execute_tool(
     - Enforces image_generation quota before create_entity with generation_prompt
     - Enforces web_search quota before web_search
     - Records a tool_call usage event after every execution (fire-and-forget)
+
+    When bridge and on_event are provided (UI_ACTION_MIRRORING):
+    - Visible entity mutations emit ui_action SSE events instead of writing directly
+    - Frontend executes the action and POSTs result back via /agent/action-result
+    - On timeout, falls back to direct execution
     """
     from agent.usage import check_quota, record_usage
+    from agent.loop import _bg
 
     _tools = {
         "create_entity": create_entity,
@@ -765,13 +797,71 @@ async def execute_tool(
                 }
 
     t0 = time.monotonic()
+
+    # UI action mirroring — intercept visible entity mutations
+    if bridge is not None and on_event is not None and name in _MIRRORED_TOOLS:
+        should_mirror = True
+        # Internal/hidden types skip mirroring — no UI representation
+        if name == "create_entity" and params.get("type", "note") in _INTERNAL_TYPES:
+            should_mirror = False
+
+        if should_mirror:
+            # Pre-process server-side (e.g. image generation) before emitting to frontend
+            mirrored_params = dict(params)
+            if name == "create_entity":
+                mirrored_params = await _preprocess_create(client, space_id, user_id, params)
+            elif name == "build_app":
+                mirrored_params = _preprocess_build_app(params)
+
+            action = bridge.create_action(action=name, params=mirrored_params)
+            await on_event({
+                "type": "ui_action",
+                "action_id": action.action_id,
+                "action": name,
+                "params": mirrored_params,
+            })
+
+            # Await the future directly — resolve() may have already fired
+            # during on_event (e.g. in tests) before we get here.
+            try:
+                result = await asyncio.wait_for(action.future, timeout=15.0)
+            except asyncio.TimeoutError:
+                bridge.cancel(action.action_id)
+                result = {"error": "ui_action_timeout", "action_id": action.action_id}
+
+            # On timeout, fall back to direct execution
+            if result.get("error") == "ui_action_timeout":
+                logger.warning(
+                    "ui_action_timeout_fallback",
+                    extra={"tool": name, "space_id": space_id},
+                )
+                # Fall through to direct execution below
+            else:
+                # Frontend responded — use its result
+                if result.get("success") is False:
+                    result = {
+                        "error": "ui_action_failed",
+                        "message": result.get("error", "unknown"),
+                    }
+                else:
+                    result = result.get("result") or result
+                await _cache_invalidate(f"entity_index:{space_id}")
+                ms = round((time.monotonic() - t0) * 1000)
+                _bg(
+                    record_usage(client, space_id, user_id, "tool_call", {
+                        "tool_name": name,
+                        "duration_ms": ms,
+                        "success": "error" not in result,
+                    })
+                )
+                return result
+
     try:
         result = await fn(client, space_id, user_id, params)
     except Exception as e:
         result = {"error": "tool_execution_failed", "tool": name, "message": str(e)}
 
     ms = round((time.monotonic() - t0) * 1000)
-    from agent.loop import _bg
     _bg(
         record_usage(client, space_id, user_id, "tool_call", {
             "tool_name": name,

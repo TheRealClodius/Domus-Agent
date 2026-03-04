@@ -216,6 +216,13 @@ async def run_agent(
         async def on_event(event):
             pass
 
+    # UI action mirroring — create bridge if enabled
+    bridge = None
+    if cfg.UI_ACTION_MIRRORING:
+        from agent.action_bridge import ActionBridge, register_bridge
+        bridge = ActionBridge()
+        register_bridge(space_id, user_id, bridge)
+
     logger.info(
         "agent_turn_start",
         extra={"space_id": space_id, "user_id": user_id, "user_timezone": user_timezone},
@@ -326,7 +333,7 @@ async def run_agent(
                 for idx, pos in zip(create_indices, positions):
                     params_list[idx]["position"] = pos
 
-            # Emit tool_call_start events (with enriched args)
+            # Emit tool_call_start + agent_attention events
             for tc, params in zip(tool_use_blocks, params_list):
                 await on_event({
                     "type": "tool_call_start",
@@ -334,12 +341,20 @@ async def run_agent(
                     "id": tc.id,
                     "args": params,
                 })
+                # Agent attention: show focus indicator on targeted entities
+                if tc.name == "read_entity" and "id" in params:
+                    await on_event({"type": "agent_attention", "entity_id": params["id"], "intent": "reading"})
+                elif tc.name == "update_entity" and "id" in params:
+                    await on_event({"type": "agent_attention", "entity_id": params["id"], "intent": "editing"})
+                elif tc.name in ("get_entity_schema", "call_entity_tool") and "entity_id" in params:
+                    await on_event({"type": "agent_attention", "entity_id": params["entity_id"], "intent": "reading"})
 
             # Execute tool calls in parallel
             async def _timed_execute(tc, params):
                 t = time.monotonic()
                 result = await execute_tool(
-                    client, tc.name, params, space_id, user_id, tier=tier
+                    client, tc.name, params, space_id, user_id,
+                    tier=tier, bridge=bridge, on_event=on_event,
                 )
                 ms = (time.monotonic() - t) * 1000
                 log_tool_execution(logger, tc.name, ms, space_id=space_id, user_id=user_id)
@@ -411,10 +426,15 @@ async def run_agent(
         else:
             _bg(_maybe_compact(client, anthropic_client, space_id, user_id))
 
+        await on_event({"type": "agent_attention_clear"})
         await on_event({"type": "done"})
 
     except Exception as e:
         await on_event({"type": "error", "message": str(e)})
         raise
+    finally:
+        if bridge is not None:
+            from agent.action_bridge import unregister_bridge
+            unregister_bridge(space_id, user_id)
 
     return assistant_text
