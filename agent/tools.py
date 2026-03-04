@@ -758,6 +758,7 @@ async def execute_tool(
     - On timeout, falls back to direct execution
     """
     from agent.usage import check_quota, record_usage
+    from agent.loop import _bg
 
     _tools = {
         "create_entity": create_entity,
@@ -825,7 +826,7 @@ async def execute_tool(
             try:
                 result = await asyncio.wait_for(action.future, timeout=15.0)
             except asyncio.TimeoutError:
-                bridge._pending.pop(action.action_id, None)
+                bridge.cancel(action.action_id)
                 result = {"error": "ui_action_timeout", "action_id": action.action_id}
 
             # On timeout, fall back to direct execution
@@ -846,7 +847,6 @@ async def execute_tool(
                     result = result.get("result") or result
                 await _cache_invalidate(f"entity_index:{space_id}")
                 ms = round((time.monotonic() - t0) * 1000)
-                from agent.loop import _bg
                 _bg(
                     record_usage(client, space_id, user_id, "tool_call", {
                         "tool_name": name,
@@ -862,7 +862,6 @@ async def execute_tool(
         result = {"error": "tool_execution_failed", "tool": name, "message": str(e)}
 
     ms = round((time.monotonic() - t0) * 1000)
-    from agent.loop import _bg
     _bg(
         record_usage(client, space_id, user_id, "tool_call", {
             "tool_name": name,

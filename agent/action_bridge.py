@@ -31,7 +31,7 @@ class ActionBridge:
 
     def create_action(self, action: str, params: dict) -> PendingAction:
         action_id = f"act_{uuid4().hex[:12]}"
-        future = asyncio.get_event_loop().create_future()
+        future = asyncio.get_running_loop().create_future()
         pa = PendingAction(
             action_id=action_id,
             action=action,
@@ -47,6 +47,10 @@ class ActionBridge:
             return False
         pa.future.set_result(result)
         return True
+
+    def cancel(self, action_id: str) -> None:
+        """Remove a pending action without resolving it (e.g. on timeout)."""
+        self._pending.pop(action_id, None)
 
     async def wait_for_result(self, action_id: str, timeout: float = 15.0) -> dict:
         pa = self._pending.get(action_id)
