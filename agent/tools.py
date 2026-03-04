@@ -10,6 +10,7 @@ Implementations are async functions that take (client, space_id, user_id, params
 import asyncio
 import time
 
+import config as cfg
 from agent.logging import get_logger
 from agent.context import _cache_invalidate
 
@@ -743,7 +744,7 @@ _MIRRORED_TOOLS = {"create_entity", "update_entity", "build_app", "update_app"}
 
 async def execute_tool(
     client, name: str, params: dict, space_id: str, user_id: str,
-    tier=None, bridge=None, on_event=None,
+    tier=None, bridge=None, on_event=None, turn_id: str | None = None,
 ) -> dict:
     """Dispatch a tool call by name. Returns the tool result or an error dict.
 
@@ -817,14 +818,22 @@ async def execute_tool(
             await on_event({
                 "type": "ui_action",
                 "action_id": action.action_id,
+                "turn_id": turn_id,
                 "action": name,
                 "params": mirrored_params,
             })
+            logger.info(
+                "ui_action_emitted",
+                extra={"tool": name, "action_id": action.action_id,
+                       "turn_id": turn_id, "space_id": space_id},
+            )
 
             # Await the future directly — resolve() may have already fired
             # during on_event (e.g. in tests) before we get here.
             try:
-                result = await asyncio.wait_for(action.future, timeout=15.0)
+                result = await asyncio.wait_for(
+                    action.future, timeout=cfg.UI_ACTION_TIMEOUT_SECONDS,
+                )
             except asyncio.TimeoutError:
                 bridge.cancel(action.action_id)
                 result = {"error": "ui_action_timeout", "action_id": action.action_id}
@@ -833,20 +842,34 @@ async def execute_tool(
             if result.get("error") == "ui_action_timeout":
                 logger.warning(
                     "ui_action_timeout_fallback",
-                    extra={"tool": name, "space_id": space_id},
+                    extra={"tool": name, "action_id": action.action_id,
+                           "turn_id": turn_id, "space_id": space_id,
+                           "timeout_seconds": cfg.UI_ACTION_TIMEOUT_SECONDS},
                 )
                 # Fall through to direct execution below
             else:
+                ms = round((time.monotonic() - t0) * 1000)
                 # Frontend responded — use its result
                 if result.get("success") is False:
+                    logger.warning(
+                        "ui_action_failed",
+                        extra={"tool": name, "action_id": action.action_id,
+                               "turn_id": turn_id, "space_id": space_id,
+                               "error": result.get("error", "unknown")},
+                    )
                     result = {
                         "error": "ui_action_failed",
                         "message": result.get("error", "unknown"),
                     }
                 else:
                     result = result.get("result") or result
+                    logger.info(
+                        "ui_action_resolved",
+                        extra={"tool": name, "action_id": action.action_id,
+                               "turn_id": turn_id, "space_id": space_id,
+                               "latency_ms": ms},
+                    )
                 await _cache_invalidate(f"entity_index:{space_id}")
-                ms = round((time.monotonic() - t0) * 1000)
                 _bg(
                     record_usage(client, space_id, user_id, "tool_call", {
                         "tool_name": name,

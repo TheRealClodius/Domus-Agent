@@ -270,6 +270,61 @@ When the agent calls `create_entity` multiple times in a single tool-call batch 
 
 ---
 
+## UI Action Mirroring (`agent/action_bridge.py` + `agent/tools.py`)
+
+When `UI_ACTION_MIRRORING=true`, visible entity mutations are routed through the frontend's UI state machine instead of being written directly by the agent.
+
+### Protocol flow
+
+1. Agent calls `create_entity` / `update_entity` / `build_app` / `update_app`
+2. `execute_tool` pre-processes server-side (e.g. image generation) then emits a `ui_action` SSE event:
+   ```json
+   {"type": "ui_action", "action_id": "act_xxx", "turn_id": "turn_yyy", "action": "create_entity", "params": {...}}
+   ```
+3. Frontend executes through its state machine, then POSTs result:
+   ```
+   POST /agent/action-result
+   {"action_id": "act_xxx", "space_id": "...", "user_id": "...", "success": true, "result": {...}}
+   ```
+4. Bridge resolves the `asyncio.Future` → agent loop continues
+
+### Timeout and fallback
+
+If the frontend doesn't respond within `UI_ACTION_TIMEOUT_SECONDS` (default 15s, configurable via env var), the agent falls back to direct server-side execution. This preserves continuity — the user sees the result regardless.
+
+### Mirrored tools
+
+Only tools in `_MIRRORED_TOOLS` are intercepted: `create_entity`, `update_entity`, `build_app`, `update_app`. Internal types (`conversation_turn`, `fact`, etc.) always bypass mirroring — they have no UI representation.
+
+### Bridge lifecycle
+
+- One `ActionBridge` per agent turn, registered in a module-level dict keyed by `(space_id, user_id)`.
+- Registered at turn start, unregistered in `finally` block on turn end.
+- In-memory only — correct for single-worker Railway deployment.
+
+### turn_id correlation
+
+Each agent turn generates a `turn_id` (e.g. `turn_a1b2c3d4e5f6`). It's included in:
+- `ui_action` SSE events
+- All mirror path structured logs
+- `agent_turn_start` log
+
+### Observability
+
+Structured log events emitted during the mirror path:
+
+| Event | Level | When |
+|-------|-------|------|
+| `ui_action_emitted` | INFO | After SSE event sent to frontend |
+| `ui_action_resolved` | INFO | Frontend responded successfully (includes `latency_ms`) |
+| `ui_action_failed` | WARNING | Frontend responded with `success: false` |
+| `ui_action_timeout_fallback` | WARNING | No response within timeout; falling back to direct execution |
+| `ui_action_callback_received` | INFO | Callback endpoint received a POST from frontend |
+
+All include `tool`, `action_id`, `turn_id`, `space_id` in extras.
+
+---
+
 ## File Attachments (`agent/loop.py`)
 
 `run_agent` accepts `context_items: list[dict]`, where each item is a file attachment from the frontend with a base64 data URL:

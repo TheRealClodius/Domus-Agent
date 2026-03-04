@@ -1734,3 +1734,144 @@ class TestExecuteToolWithBridge:
 
         assert result["error"] == "ui_action_failed"
         assert result["message"] == "folder_has_children"
+
+    @pytest.mark.asyncio
+    @patch("agent.loop._bg")
+    async def test_ui_action_includes_turn_id(self, _mock_bg):
+        """ui_action SSE events include the turn_id field."""
+        from agent.action_bridge import ActionBridge
+
+        bridge = ActionBridge()
+        events = []
+
+        async def on_event(e):
+            events.append(e)
+            if e.get("type") == "ui_action":
+                bridge.resolve(e["action_id"], {
+                    "success": True,
+                    "result": {"id": "ent_new", "type": "note"},
+                })
+
+        result = await execute_tool(
+            None, "create_entity", {"type": "note", "content": "hello"},
+            TEST_SPACE_ID, TEST_USER_ID,
+            bridge=bridge, on_event=on_event, turn_id="turn_test123",
+        )
+
+        ui_actions = [e for e in events if e["type"] == "ui_action"]
+        assert len(ui_actions) == 1
+        assert ui_actions[0]["turn_id"] == "turn_test123"
+
+    @pytest.mark.asyncio
+    @patch("agent.loop._bg")
+    async def test_configurable_timeout(self, _mock_bg):
+        """Mirror path uses UI_ACTION_TIMEOUT_SECONDS from config."""
+        from agent.action_bridge import ActionBridge
+
+        bridge = ActionBridge()
+        events = []
+
+        async def on_event(e):
+            events.append(e)
+            # Don't resolve — let it timeout
+
+        client = MockSupabaseClient()
+        entity = _make_entity(entity_type="note")
+        client.set_table_response("entities", [entity])
+
+        with patch("httpx.AsyncClient") as MockClient:
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.json.return_value = entity
+            mock_http = AsyncMock()
+            mock_http.__aenter__ = AsyncMock(return_value=mock_http)
+            mock_http.__aexit__ = AsyncMock(return_value=False)
+            mock_http.post = AsyncMock(return_value=mock_resp)
+            MockClient.return_value = mock_http
+
+            # Use a very short timeout via config
+            with patch("agent.tools.cfg.UI_ACTION_TIMEOUT_SECONDS", 0.01), \
+                 patch("config.DOMUS_FRONTEND_URL", "http://test:3000"), \
+                 patch("config.DOMUS_SERVICE_TOKEN", "tok"):
+                result = await execute_tool(
+                    client, "create_entity", {"type": "note", "content": "test"},
+                    TEST_SPACE_ID, TEST_USER_ID,
+                    bridge=bridge, on_event=on_event,
+                )
+
+        # Should have timed out and fallen back to direct execution
+        assert "error" not in result
+
+    @pytest.mark.asyncio
+    @patch("agent.loop._bg")
+    async def test_late_resolve_after_fallback_is_noop(self, _mock_bg):
+        """If callback arrives after timeout+fallback, resolve is a no-op."""
+        from agent.action_bridge import ActionBridge
+
+        bridge = ActionBridge()
+        events = []
+
+        async def on_event(e):
+            events.append(e)
+            # Don't resolve — let it timeout
+
+        client = MockSupabaseClient()
+        entity = _make_entity(entity_type="note")
+        client.set_table_response("entities", [entity])
+
+        with patch("httpx.AsyncClient") as MockClient:
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.json.return_value = entity
+            mock_http = AsyncMock()
+            mock_http.__aenter__ = AsyncMock(return_value=mock_http)
+            mock_http.__aexit__ = AsyncMock(return_value=False)
+            mock_http.post = AsyncMock(return_value=mock_resp)
+            MockClient.return_value = mock_http
+
+            with patch("agent.tools.cfg.UI_ACTION_TIMEOUT_SECONDS", 0.01), \
+                 patch("config.DOMUS_FRONTEND_URL", "http://test:3000"), \
+                 patch("config.DOMUS_SERVICE_TOKEN", "tok"):
+                result = await execute_tool(
+                    client, "create_entity", {"type": "note", "content": "test"},
+                    TEST_SPACE_ID, TEST_USER_ID,
+                    bridge=bridge, on_event=on_event,
+                )
+
+        # Direct execution succeeded
+        assert "error" not in result
+
+        # Late resolve is a no-op
+        ui_actions = [e for e in events if e.get("type") == "ui_action"]
+        assert len(ui_actions) == 1
+        late_resolved = bridge.resolve(
+            ui_actions[0]["action_id"], {"success": True, "result": {"id": "late"}}
+        )
+        assert late_resolved is False
+
+    @pytest.mark.asyncio
+    @patch("agent.loop._bg")
+    async def test_mirror_path_logs_emitted(self, _mock_bg, caplog):
+        """Mirror path emits ui_action_emitted and ui_action_resolved logs."""
+        import logging
+        from agent.action_bridge import ActionBridge
+
+        bridge = ActionBridge()
+
+        async def on_event(e):
+            if e.get("type") == "ui_action":
+                bridge.resolve(e["action_id"], {
+                    "success": True,
+                    "result": {"id": "ent_new"},
+                })
+
+        with caplog.at_level(logging.INFO, logger="agent.tools"):
+            await execute_tool(
+                None, "create_entity", {"type": "note", "content": "hi"},
+                TEST_SPACE_ID, TEST_USER_ID,
+                bridge=bridge, on_event=on_event, turn_id="turn_log_test",
+            )
+
+        messages = [r.message for r in caplog.records]
+        assert "ui_action_emitted" in messages
+        assert "ui_action_resolved" in messages

@@ -299,6 +299,7 @@ class ActionResultRequest(BaseModel):
     success: bool
     result: dict | None = None
     error: str | None = None
+    turn_id: str | None = None
 
 
 @app.post("/agent/action-result", dependencies=[Depends(verify_service_auth)])
@@ -323,6 +324,11 @@ async def action_result(req: ActionResultRequest):
     if not resolved:
         raise HTTPException(status_code=404, detail="Unknown or expired action_id")
 
+    logger.info(
+        "ui_action_callback_received",
+        extra={"action_id": req.action_id, "space_id": req.space_id,
+               "success": req.success},
+    )
     return {"ok": True}
 
 
