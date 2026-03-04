@@ -822,12 +822,6 @@ async def execute_tool(
                 "action": name,
                 "params": mirrored_params,
             })
-            logger.info(
-                "ui_action_emitted",
-                extra={"tool": name, "action_id": action.action_id,
-                       "turn_id": turn_id, "space_id": space_id},
-            )
-
             # Await the future directly — resolve() may have already fired
             # during on_event (e.g. in tests) before we get here.
             try:

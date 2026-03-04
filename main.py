@@ -299,7 +299,6 @@ class ActionResultRequest(BaseModel):
     success: bool
     result: dict | None = None
     error: str | None = None
-    turn_id: str | None = None
 
 
 @app.post("/agent/action-result", dependencies=[Depends(verify_service_auth)])

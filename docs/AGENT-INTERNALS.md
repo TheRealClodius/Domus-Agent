@@ -315,7 +315,6 @@ Structured log events emitted during the mirror path:
 
 | Event | Level | When |
 |-------|-------|------|
-| `ui_action_emitted` | INFO | After SSE event sent to frontend |
 | `ui_action_resolved` | INFO | Frontend responded successfully (includes `latency_ms`) |
 | `ui_action_failed` | WARNING | Frontend responded with `success: false` |
 | `ui_action_timeout_fallback` | WARNING | No response within timeout; falling back to direct execution |
