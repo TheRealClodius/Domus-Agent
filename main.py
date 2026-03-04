@@ -288,6 +288,45 @@ async def agent_endpoint(req: AgentRequest, request: Request):
 
 
 # ---------------------------------------------------------------------------
+# UI Action Mirroring — callback endpoint
+# ---------------------------------------------------------------------------
+
+
+class ActionResultRequest(BaseModel):
+    action_id: str
+    space_id: str
+    user_id: str
+    success: bool
+    result: dict | None = None
+    error: str | None = None
+
+
+@app.post("/agent/action-result", dependencies=[Depends(verify_service_auth)])
+async def action_result(req: ActionResultRequest):
+    """Receive the result of a ui_action from the frontend.
+
+    The frontend executes the action through its UI state machine and POSTs
+    the result here. This resolves the pending Future in the ActionBridge,
+    allowing the agent loop to continue.
+    """
+    from agent.action_bridge import get_bridge
+
+    bridge = get_bridge(req.space_id, req.user_id)
+    if bridge is None:
+        raise HTTPException(status_code=404, detail="No active agent turn")
+
+    resolved = bridge.resolve(req.action_id, {
+        "success": req.success,
+        "result": req.result,
+        "error": req.error,
+    })
+    if not resolved:
+        raise HTTPException(status_code=404, detail="Unknown or expired action_id")
+
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
 # Admin observability endpoints
 # ---------------------------------------------------------------------------
 

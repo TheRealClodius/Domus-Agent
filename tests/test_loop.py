@@ -219,6 +219,7 @@ class TestSSEEvents:
             "tool_call_start",
             "tool_call_result",
             "text_delta",
+            "agent_attention_clear",
             "done",
         ]
 
@@ -443,14 +444,14 @@ class TestMultiTurnAgent:
             "Create a note",
         )
 
-        mock_execute.assert_called_once_with(
-            mock_supabase,
-            "create_entity",
-            {"type": "note", "state": {"title": "My Note"}},
-            TEST_SPACE_ID,
-            TEST_USER_ID,
-            tier=None,
-        )
+        mock_execute.assert_called_once()
+        call_args = mock_execute.call_args
+        assert call_args[0][0] is mock_supabase  # client
+        assert call_args[0][1] == "create_entity"  # tool name
+        assert call_args[0][2] == {"type": "note", "state": {"title": "My Note"}}  # params
+        assert call_args[0][3] == TEST_SPACE_ID
+        assert call_args[0][4] == TEST_USER_ID
+        assert call_args[1]["tier"] is None
 
     @patch("agent.loop.build_system_prompt", new_callable=AsyncMock, return_value="test prompt")
     @patch("agent.loop.execute_tool", new_callable=AsyncMock, return_value={"id": "entity-1", "type": "note"})
@@ -1379,7 +1380,7 @@ class TestReturnExceptions:
 
         call_count = 0
 
-        async def mock_execute(client, name, params, space_id, user_id, tier=None):
+        async def mock_execute(client, name, params, space_id, user_id, tier=None, bridge=None, on_event=None):
             nonlocal call_count
             call_count += 1
             if call_count == 1:
@@ -1444,3 +1445,152 @@ class TestBgTaskHelper:
         task = _bg(_noop())
         assert isinstance(task, asyncio.Task)
         await task  # cleanup
+
+
+# ---------------------------------------------------------------------------
+# UI Action Mirroring — bridge lifecycle + attention events
+# ---------------------------------------------------------------------------
+
+
+class TestBridgeLifecycle:
+    """Bridge is registered/unregistered around run_agent when flag is on."""
+
+    @patch("agent.loop.build_system_prompt", new_callable=AsyncMock, return_value="prompt")
+    @patch("config.UI_ACTION_MIRRORING", True)
+    async def test_bridge_registered_when_flag_on(self, mock_prompt, mock_supabase, make_entity):
+        """When UI_ACTION_MIRRORING=True, bridge is registered and then unregistered."""
+        from agent.action_bridge import get_bridge
+
+        mock_supabase.set_table_response("entities", [
+            make_entity(entity_type="conversation_turn")
+        ])
+
+        mock_anthropic = MagicMock()
+        mock_anthropic.messages.create = AsyncMock(
+            return_value=_make_text_response("Hi!")
+        )
+
+        bridge_was_active = False
+
+        async def spy_event(e):
+            nonlocal bridge_was_active
+            if get_bridge(TEST_SPACE_ID, TEST_USER_ID) is not None:
+                bridge_was_active = True
+
+        await run_agent(
+            mock_supabase, mock_anthropic,
+            TEST_SPACE_ID, TEST_USER_ID, "Hello",
+            on_event=spy_event,
+        )
+
+        assert bridge_was_active, "Bridge should have been active during run_agent"
+        assert get_bridge(TEST_SPACE_ID, TEST_USER_ID) is None, "Bridge should be unregistered after"
+
+    @patch("agent.loop.build_system_prompt", new_callable=AsyncMock, return_value="prompt")
+    @patch("config.UI_ACTION_MIRRORING", False)
+    async def test_bridge_not_registered_when_flag_off(self, mock_prompt, mock_supabase, make_entity):
+        """When UI_ACTION_MIRRORING=False, no bridge is created."""
+        from agent.action_bridge import get_bridge
+
+        mock_supabase.set_table_response("entities", [
+            make_entity(entity_type="conversation_turn")
+        ])
+
+        mock_anthropic = MagicMock()
+        mock_anthropic.messages.create = AsyncMock(
+            return_value=_make_text_response("Hi!")
+        )
+
+        await run_agent(
+            mock_supabase, mock_anthropic,
+            TEST_SPACE_ID, TEST_USER_ID, "Hello",
+        )
+
+        assert get_bridge(TEST_SPACE_ID, TEST_USER_ID) is None
+
+
+class TestAttentionEvents:
+    """Agent attention events are emitted before tool execution."""
+
+    @patch("agent.loop.build_system_prompt", new_callable=AsyncMock, return_value="prompt")
+    @patch("agent.loop.execute_tool", new_callable=AsyncMock, return_value={"id": "e1", "type": "note"})
+    async def test_attention_emitted_for_read_entity(self, mock_exec, mock_prompt, mock_supabase, make_entity):
+        """read_entity should emit agent_attention with intent=reading."""
+        mock_supabase.set_table_response("entities", [
+            make_entity(entity_type="conversation_turn")
+        ])
+
+        mock_anthropic = MagicMock()
+        # First call: tool use (read_entity), second call: text response
+        mock_anthropic.messages.create = AsyncMock(side_effect=[
+            _make_tool_response("read_entity", "tool_1", {"id": "ent_42"}),
+            _make_text_response("Here it is."),
+        ])
+
+        events = []
+
+        async def capture(e):
+            events.append(e)
+
+        await run_agent(
+            mock_supabase, mock_anthropic,
+            TEST_SPACE_ID, TEST_USER_ID, "Read entity ent_42",
+            on_event=capture,
+        )
+
+        attention_events = [e for e in events if e.get("type") == "agent_attention"]
+        assert len(attention_events) == 1
+        assert attention_events[0]["entity_id"] == "ent_42"
+        assert attention_events[0]["intent"] == "reading"
+
+    @patch("agent.loop.build_system_prompt", new_callable=AsyncMock, return_value="prompt")
+    @patch("agent.loop.execute_tool", new_callable=AsyncMock, return_value={"id": "e1"})
+    async def test_attention_emitted_for_update_entity(self, mock_exec, mock_prompt, mock_supabase, make_entity):
+        """update_entity should emit agent_attention with intent=editing."""
+        mock_supabase.set_table_response("entities", [
+            make_entity(entity_type="conversation_turn")
+        ])
+
+        mock_anthropic = MagicMock()
+        mock_anthropic.messages.create = AsyncMock(side_effect=[
+            _make_tool_response("update_entity", "tool_1", {"id": "ent_99", "content": "new"}),
+            _make_text_response("Updated."),
+        ])
+
+        events = []
+        await run_agent(
+            mock_supabase, mock_anthropic,
+            TEST_SPACE_ID, TEST_USER_ID, "Update it",
+            on_event=lambda e: events.append(e) or asyncio.sleep(0),
+        )
+
+        attention_events = [e for e in events if e.get("type") == "agent_attention"]
+        assert len(attention_events) == 1
+        assert attention_events[0]["entity_id"] == "ent_99"
+        assert attention_events[0]["intent"] == "editing"
+
+    @patch("agent.loop.build_system_prompt", new_callable=AsyncMock, return_value="prompt")
+    async def test_attention_clear_emitted_on_done(self, mock_prompt, mock_supabase, make_entity):
+        """agent_attention_clear is emitted right before done."""
+        mock_supabase.set_table_response("entities", [
+            make_entity(entity_type="conversation_turn")
+        ])
+
+        mock_anthropic = MagicMock()
+        mock_anthropic.messages.create = AsyncMock(
+            return_value=_make_text_response("Done.")
+        )
+
+        events = []
+        await run_agent(
+            mock_supabase, mock_anthropic,
+            TEST_SPACE_ID, TEST_USER_ID, "Hello",
+            on_event=lambda e: events.append(e) or asyncio.sleep(0),
+        )
+
+        event_types = [e["type"] for e in events]
+        assert "agent_attention_clear" in event_types
+        # attention_clear should come right before done
+        clear_idx = event_types.index("agent_attention_clear")
+        done_idx = event_types.index("done")
+        assert clear_idx == done_idx - 1

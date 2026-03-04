@@ -40,6 +40,11 @@ COMPACTION_TURN_THRESHOLD: int = 40
 # Debug — expose /debug/prompt endpoint (off by default, never enable in prod)
 DEBUG_PROMPT_ENABLED: bool = os.getenv("DEBUG_PROMPT_ENABLED", "false").lower() == "true"
 
+# UI action mirroring — when enabled, agent emits ui_action SSE events for visible
+# entity mutations instead of writing directly. Frontend executes through its UI
+# state machine and POSTs results back to /agent/action-result.
+UI_ACTION_MIRRORING: bool = os.getenv("UI_ACTION_MIRRORING", "false").lower() == "true"
+
 # ---------------------------------------------------------------------------
 # Billing tier limits (daily quotas per event_type)
 # ---------------------------------------------------------------------------
