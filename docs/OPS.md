@@ -25,7 +25,6 @@ How to run, test, and deploy the agent service. For system-wide architecture, se
 | `Pillow` | >=11.0 | Image processing (PNG validation, dimensions) |
 | `httpx` | >=0.28 | Perplexity API calls |
 | `supabase` | >=2.28 | DB client (async via `acreate_client()`) |
-| `networkx` | >=3.6 | Entity graph operations |
 
 **Dev:**
 
