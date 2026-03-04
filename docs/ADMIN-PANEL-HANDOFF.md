@@ -16,7 +16,8 @@ Two new GET endpoints in `main.py`, both protected by `Authorization: Bearer <DO
 
 Snapshots the Domus agent's assembled context for a given space. Runs all 7 context
 fetchers in parallel (same ones used to build the live system prompt) plus 4 health
-count queries. No side effects.
+count queries. Clears the in-process entity index cache on entry so the response
+always reflects live Supabase state (not a 60s-stale snapshot).
 
 **Full response shape:**
 ```json
@@ -25,14 +26,24 @@ count queries. No side effects.
   "space_id": "uuid",
   "user_id": "uuid",
   "assembled_at": "2026-03-03T12:00:00+00:00",
+  "prompt_structure": {
+    "total_chars": 14200,
+    "token_estimate": 3550,
+    "model": "claude-sonnet-4-6",
+    "blocks": {
+      "static":      { "chars": 12400, "token_estimate": 3100, "cached": true },
+      "semi_static": { "chars": 1800,  "token_estimate": 450,  "cached": true },
+      "dynamic":     { "chars": 0,     "token_estimate": 0,    "cached": false }
+    }
+  },
   "blocks": {
     "static": {
       "chars": 12400,
       "token_estimate": 3100,
       "cached": true,
       "sections": {
-        "base_instructions": { "chars": 7200 },
-        "iframe_builder_context": { "chars": 5200 }
+        "base_instructions": { "chars": 2300 },
+        "iframe_builder_context": { "chars": 700 }
       }
     },
     "semi_static": {
@@ -82,7 +93,7 @@ count queries. No side effects.
 
 ---
 
-### `GET /admin/builder-context?space_id=X`
+### `GET /admin/builder-context?space_id=X&user_id=Y`
 
 Snapshots the builder agent's static prompt structure and all `type=app` entities
 in the space, split by kind.
@@ -92,6 +103,7 @@ in the space, split by kind.
 {
   "agent": "builder",
   "space_id": "uuid",
+  "user_id": "uuid",
   "assembled_at": "2026-03-03T12:00:00+00:00",
   "prompt_structure": {
     "total_chars": 6800,
@@ -166,10 +178,10 @@ Fetch `/api/admin/domus-context?space_id=<current>&user_id=<current>`.
 - Fact count, edge count, summary count — three small stat chips
 - `assembled_at` timestamp
 
-**Prompt token budget:**
-- Three rows (Static / Semi-static / Dynamic) showing token estimates
-- Static and semi-static marked as "cached"
-- Char counts for the two static subsections (base instructions, iframe builder context)
+**Prompt structure:**
+- Total token estimate + model name (from `prompt_structure`)
+- Three rows (Static / Semi-static / Dynamic) showing token estimates and cached status
+- Char counts for the two static subsections (base instructions, iframe builder context) — found in `blocks.static.sections`
 
 **Entity index:**
 - Total entity count + breakdown by type (small tag list or table)
@@ -182,7 +194,7 @@ Fetch `/api/admin/domus-context?space_id=<current>&user_id=<current>`.
 
 ### Builder Agent section
 
-Fetch `/api/admin/builder-context?space_id=<current>`.
+Fetch `/api/admin/builder-context?space_id=<current>&user_id=<current>`.
 
 **Prompt structure:**
 - Total token estimate

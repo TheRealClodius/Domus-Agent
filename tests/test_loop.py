@@ -6,7 +6,9 @@ import logging
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from agent.loop import save_conversation_turn, run_agent, format_sse_event
+import asyncio
+
+from agent.loop import save_conversation_turn, run_agent, format_sse_event, _bg, _bg_tasks
 from tests.conftest import TEST_SPACE_ID, TEST_USER_ID, _make_entity, MockSupabaseClient
 
 
@@ -1318,3 +1320,127 @@ class TestTokenUsageLogging:
             "anthropic_token_usage" in record.message
             for record in caplog.records
         )
+
+
+# ---------------------------------------------------------------------------
+# TestReturnExceptions — P1-2: asyncio.gather return_exceptions
+# ---------------------------------------------------------------------------
+
+
+class TestReturnExceptions:
+    """asyncio.gather(return_exceptions=True) keeps the batch alive on a single failure."""
+
+    @patch("agent.loop.build_system_prompt")
+    async def test_tool_batch_continues_on_single_failure(
+        self, mock_bsp, mock_supabase, make_entity
+    ):
+        """When one tool raises, the other tool result is still emitted.
+
+        Verifies that return_exceptions=True prevents the entire batch from aborting
+        and that the exception is normalised into an error dict.
+        """
+        mock_bsp.return_value = "test prompt"
+        mock_supabase.set_table_response("entities", [make_entity()])
+
+        # First Claude response: two tool use blocks
+        tool_block_1 = MagicMock()
+        tool_block_1.type = "tool_use"
+        tool_block_1.name = "read_entity"
+        tool_block_1.id = "tc-1"
+        tool_block_1.input = {"id": "entity-1"}
+
+        tool_block_2 = MagicMock()
+        tool_block_2.type = "tool_use"
+        tool_block_2.name = "read_entity"
+        tool_block_2.id = "tc-2"
+        tool_block_2.input = {"id": "entity-2"}
+
+        first_response = MagicMock()
+        first_response.content = [tool_block_1, tool_block_2]
+        first_response.stop_reason = "tool_use"
+
+        # Second Claude response: text only (terminates loop)
+        text_block = MagicMock()
+        text_block.type = "text"
+        text_block.text = "Done"
+        second_response = MagicMock()
+        second_response.content = [text_block]
+        second_response.stop_reason = "end_turn"
+
+        mock_anthropic = MagicMock()
+        mock_anthropic.messages.create = AsyncMock(
+            side_effect=[first_response, second_response]
+        )
+
+        events = []
+
+        async def on_event(event):
+            events.append(event)
+
+        call_count = 0
+
+        async def mock_execute(client, name, params, space_id, user_id, tier=None):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return {"ok": True, "id": "entity-1"}
+            raise RuntimeError("Simulated tool failure")
+
+        with patch("agent.loop.execute_tool", new=mock_execute):
+            await run_agent(
+                mock_supabase,
+                mock_anthropic,
+                space_id=TEST_SPACE_ID,
+                user_id=TEST_USER_ID,
+                message="test",
+                on_event=on_event,
+            )
+
+        tool_results = [e for e in events if e.get("type") == "tool_call_result"]
+        assert len(tool_results) == 2, f"Expected 2 tool results, got: {tool_results}"
+
+        result_data = [e["result"] for e in tool_results]
+        error_results = [r for r in result_data if "error" in r]
+        success_results = [r for r in result_data if "ok" in r]
+
+        assert len(success_results) == 1
+        assert len(error_results) == 1
+        assert error_results[0]["error"] == "tool_execution_failed"
+        assert "Simulated tool failure" in error_results[0]["message"]
+
+
+# ---------------------------------------------------------------------------
+# TestBgTaskHelper
+# ---------------------------------------------------------------------------
+
+
+class TestBgTaskHelper:
+    """_bg() keeps a reference to in-flight tasks and removes it on completion."""
+
+    async def test_bg_task_helper_keeps_reference(self):
+        """Task is in _bg_tasks while running, removed after completion."""
+        completed = asyncio.Event()
+
+        async def _slow():
+            await asyncio.sleep(0)
+            completed.set()
+
+        task = _bg(_slow())
+        assert task in _bg_tasks
+
+        # Let the event loop run the coroutine to completion and fire the done callback
+        await asyncio.sleep(0)  # task runs to its internal sleep(0)
+        await asyncio.sleep(0)  # task completes
+        await asyncio.sleep(0)  # done_callback fires (scheduled for next tick)
+
+        assert task not in _bg_tasks
+        assert completed.is_set()
+
+    async def test_bg_returns_task(self):
+        """_bg() returns the asyncio.Task it creates."""
+        async def _noop():
+            pass
+
+        task = _bg(_noop())
+        assert isinstance(task, asyncio.Task)
+        await task  # cleanup

@@ -21,6 +21,8 @@ A `while True` loop using the Anthropic SDK directly. No framework.
 
 **Tier parameter:** `run_agent(..., tier=None)` accepts the resolved `Tier` enum from `main.py`. Passed through to `execute_tool()` for quota enforcement. When `tier=Tier.FREE`, compaction is skipped (no Opus budget).
 
+**Background tasks (`_bg`):** All fire-and-forget coroutines (`record_usage`, compaction, trim) are scheduled via `_bg(coro)` — a thin wrapper around `asyncio.create_task()` that stores the task reference in `_bg_tasks: set` to prevent the garbage collector from cancelling it before it completes. The reference is removed by a done-callback on task completion.
+
 **Streaming:** The loop streams SSE events to the frontend via `on_event` callback. Text deltas and tool call results (including created/updated entities) flow through immediately — the frontend doesn't wait for CDC.
 
 ---
@@ -31,7 +33,7 @@ The system prompt is thin. Three cacheable blocks, assembled fresh each turn.
 
 **Block 0 — static (always the same):**
 - `_BASE_INSTRUCTIONS`: entity type schemas, app-specific action flows, presentation modes, singleton app rules
-- `IFRAME_BUILDER_CONTEXT` (`prompts/iframe_builder.py`): React + shadcn/ui guide for `build_app`
+- `IFRAME_BUILDER_CONTEXT` (`prompts/iframe_builder.py`): spec-writing brief for `build_app` — how to write a good spec and delegate to the builder agent. Intentionally thin: design system details belong in the builder agent's prompt, not here.
 
 **Block 1 — semi-static (changes when space state changes):**
 - Space name, user name
@@ -39,7 +41,7 @@ The system prompt is thin. Three cacheable blocks, assembled fresh each turn.
 - Conversation summaries: all `conversation_summary` entities, oldest first
 - Personality traits: all `personality_trait` entities in the space
 - `=== Recently Active ===`: top 3 entities by `updated_at` descending — gives the agent a recency signal without extra queries
-- Entity index: `[type] id: summary (presentation)` for all non-archived, **non-hidden** entities
+- Entity index: `[type] id: summary (presentation)` for all non-archived entities, excluding internal memory types (`conversation_turn`, `conversation_summary`, `fact`, `edge`, `personality_trait`). User-created entities are always included — even docked ones (`presentation='hidden'`).
 
 **Block 2 — dynamic (changes every turn):**
 - Canvas context:
@@ -57,7 +59,7 @@ The system prompt is thin. Three cacheable blocks, assembled fresh each turn.
 
 ## Prompt Caching (`agent/context.py` + `agent/loop.py`)
 
-Static content (~6.5k tokens of instructions + builder context) is re-used across all turns and tool-call iterations. Without caching it is re-tokenized on every Anthropic API call — 3× per turn for a 3-tool turn. Prompt caching gives ~60% TPM reduction on static tokens and 10% of normal billing cost for cached reads.
+Static content (~750 tokens of instructions + builder context) is re-used across all turns and tool-call iterations. Without caching it is re-tokenized on every Anthropic API call — 3× per turn for a 3-tool turn. Prompt caching gives ~60% TPM reduction on static tokens and 10% of normal billing cost for cached reads.
 
 ### 4-breakpoint structure per API call
 
@@ -92,11 +94,11 @@ A module-level dict avoids redundant Supabase round-trips within and between tur
 
 | Key pattern | TTL | Data |
 |-------------|-----|------|
-| `entity_index:{space_id}` | 60 s | Non-hidden entity summaries (`id, type, presentation, z_index, summary, updated_at, created_at`) |
+| `entity_index:{space_id}` | 60 s | User-facing entity summaries (`id, type, presentation, z_index, summary, updated_at, created_at`) — internal types excluded, hidden (docked) user entities included |
 | `user_profile:{user_id}` | 300 s | User profile row |
 | `space_info:{space_id}` | 300 s | Space metadata row |
 
-Cache is populated on first access and served from memory on subsequent calls. `_cache_invalidate(key)` clears a specific entry (called by tools that mutate entities).
+Cache is populated on first access and served from memory on subsequent calls. `_cache_invalidate(key)` is async (lock-protected) and clears a specific entry. It is awaited by every tool that mutates entities (`create_entity`, `update_entity`, `build_app`, `update_app`, `call_entity_tool`) on success. The `/admin/domus-context` endpoint also awaits it on entry to guarantee live Supabase state in the response.
 
 ### Parallel context queries
 
@@ -218,7 +220,7 @@ Nine tools are defined in `TOOL_DEFINITIONS` and dispatched through `execute_too
 
 | Tool | What it does |
 |------|-------------|
-| `create_entity` | Create any entity (notes, calendar events, images, apps, edges, facts) |
+| `create_entity` | Create any entity. Internal types bypass the frontend (see below). |
 | `update_entity` | Patch entity state via RFC 7396 JSON Merge Patch |
 | `query_entities` | Search/filter entities — returns `(id, type, summary, presentation, created_at)` |
 | `read_entity` | Get one entity's full state by ID |
@@ -237,6 +239,22 @@ If you're tempted to add a tenth tool, you're probably doing something wrong.
 - Arrays are always replaced entirely (agent does read-modify-write to append)
 - Omitted fields are preserved
 
+### `create_entity` dual routing
+
+`create_entity` routes based on `_INTERNAL_TYPES`:
+
+```python
+_INTERNAL_TYPES = {
+    "conversation_turn", "conversation_summary",
+    "fact", "personality_trait", "edge",
+}
+```
+
+- **Internal types** → insert directly to Supabase with `presentation: "hidden"` enforced (no httpx call). The caller's `presentation` param is ignored — these types must never appear on canvas.
+- **User-facing types** → POST to `domus-web /api/entities` as before (frontend applies its own presentation rules, Realtime broadcasts to the canvas).
+
+This prevents the frontend from rendering memory/system entities as visible cards when it doesn't recognise the type.
+
 ### Quota enforcement in `execute_tool`
 
 `execute_tool(client, name, params, space_id, user_id, tier=None)` enforces per-tool quotas when `tier` is provided:
@@ -244,7 +262,7 @@ If you're tempted to add a tenth tool, you're probably doing something wrong.
 - **image generation:** before calling `create_entity` with `type='image'` and `state.generation_prompt` present, checks `check_quota(..., "image_generation")`. If exhausted, returns `{"error": "quota_exhausted", ...}` — Gemini is never called.
 - **web search:** before calling `web_search`, checks `check_quota(..., "web_search")`. Same short-circuit.
 
-After every execution (success or error), fires `record_usage(event_type='tool_call')` as `asyncio.create_task()` — never blocks the SSE stream.
+After every execution (success or error), fires `record_usage(event_type='tool_call')` via `_bg()` — never blocks the SSE stream.
 
 ### Batch auto-positioning
 
@@ -281,6 +299,8 @@ Uses Gemini, called automatically from `create_entity` in `tools.py` when `type=
 **Dependencies:** `google-genai`, `Pillow` (PIL)
 
 **Trigger:** `create_entity(type='image', state={ generation_prompt: "..." })` — `tools.py` detects the combination and calls `generate_image()` before inserting the entity.
+
+**Key name normalization:** `create_entity` also accepts `state.prompt` (common LLM alias) and silently normalizes it to `state.generation_prompt`. The tool description explicitly calls out `generation_prompt` to keep the agent on the right path — if that description is ever weakened, the LLM defaults to `prompt` and generation silently fails (entity is created without an image_url).
 
 **Pipeline (all in-memory):**
 ```
@@ -351,6 +371,18 @@ The agent queries edges on demand via `query_entities(type='edge')`. Graph conte
 
 Memory is not a separate system. It's entities with `presentation: 'hidden'`.
 
+**Legitimate `presentation='hidden'` uses** — these are not bugs:
+
+| Who sets it | Entity / situation | Why |
+|-------------|-------------------|-----|
+| Agent | `conversation_turn`, `conversation_summary`, `fact`, `edge`, `personality_trait` | Internal memory — never on canvas |
+| Frontend | Images/notes inside a folder (`gather`/`add_children`) | Folder is the canvas item; children are hidden |
+| Frontend | `calendar_event` | Always accessed via the calendar entity, never standalone |
+| Frontend | Singleton dock apps (`calendar`, `chat`, `settings`, `sounds`) | Managed by the dock; not canvas windows |
+| User / Frontend | Any entity the user docks (minimises) | Restored via dock click or agent `update_entity` → `presentation: 'window'` |
+
+**Bug pattern (now fixed in frontend):** `Window.tsx` close button and `scatterFolder`/`ejectFromFolder` paths were calling `updatePresentation(id, 'hidden')` instead of `archive(id)`. This left ghost entities — visible to neither the user nor (previously) the agent.
+
 | Entity type | Purpose |
 |-------------|---------|
 | `conversation_turn` | A single user or assistant message |
@@ -363,10 +395,9 @@ Memory is not a separate system. It's entities with `presentation: 'hidden'`.
 1. Take turns beyond the recent window
 2. Call Opus: "Summarize this conversation segment. Extract any facts about the user."
 3. Create `conversation_summary` entity
-4. Create `fact` entities for new facts
-5. Create `edge` entities for discovered relationships
-6. Archive original turns (`archived: true`)
-7. Fire-and-forget `record_usage(event_type='compaction')` with Opus token counts
+4. Create `fact`, `personality_trait`, and `edge` entities in parallel via `asyncio.gather`
+5. Archive original turns (`archived: true`)
+6. Fire-and-forget `record_usage(event_type='compaction')` with Opus token counts via `_bg()`
 
 **No embeddings.** Recency + full-text search + knowledge graph.
 
@@ -407,6 +438,10 @@ Quotas reset at midnight UTC. `check_quota()` counts `usage_events` rows since m
 
 `check_rate_limit(user_id, tier)` uses an in-memory sliding window (`_rate_windows` dict, module-level). Returns `(allowed: bool, retry_after_seconds: int)`.
 
+### Concurrent turn slots
+
+`acquire_turn_slot(user_id, tier)` and `release_turn_slot(user_id)` are both **async** and guarded by `_active_turns_lock`. The lock prevents the TOCTOU race in the read-modify-write on the shared `_active_turns` counter. `release_turn_slot` is idempotent — safe to call even if no slot was held. The `_tier_cache` dict is intentionally not lock-protected: a concurrent miss for the same user causes two identical writes, which is benign.
+
 ### Usage events recorded
 
 | Event type | Recorded in | Metadata |
@@ -416,7 +451,7 @@ Quotas reset at midnight UTC. `check_quota()` counts `usage_events` rows since m
 | `image_generation` | `image_gen.py` after upload | `model`, `prompt_length` |
 | `compaction` | `memory.py` after Opus call | `input_tokens`, `output_tokens`, `turns_compacted` |
 
-All `record_usage()` calls go via `asyncio.create_task()` — they never block the SSE stream. `record_usage()` catches all exceptions and logs as warnings.
+All `record_usage()` calls go via `_bg()` (module-level helper in `loop.py`) — they never block the SSE stream. `_bg()` keeps a strong reference to in-flight tasks in `_bg_tasks` to prevent premature GC. `record_usage()` catches all exceptions and logs as warnings.
 
 ### `usage_events` table schema (migration D-2)
 
@@ -442,13 +477,13 @@ Two systems exist for agent-generated apps:
 
 ### React Iframe Apps (`build_app` / `update_app`)
 
-The primary system. The main agent calls `build_app` directly — no background task.
+The primary system. The Domus agent writes a spec and calls `build_app`; the builder agent handles code generation and design system compliance.
 
 - **Tool:** `build_app(name, icon, description, code, schema, initial_state)` → creates `type='app'` entity
 - **Runtime:** React + shadcn/ui in a sandboxed iframe. Code stored in `state._code`, tool schemas in `state._schema`, app metadata in `state._meta`.
-- **Iteration:** `update_app(entity_id, code?, schema?, state_patch?)` to fix or extend
-- **Interaction:** `get_entity_schema` + `call_entity_tool` to test the running app from the agent
-- **Prompt context:** `IFRAME_BUILDER_CONTEXT` from `agent/prompts/iframe_builder.py` is always in Block 0
+- **Iteration:** `update_app(entity_id, code?, schema?, state_patch?)` — Domus describes what to change; builder implements it
+- **Interaction:** `get_entity_schema` + `call_entity_tool` to verify and interact with the running app
+- **Prompt context:** `IFRAME_BUILDER_CONTEXT` in Block 0 is a thin spec-writing brief (~700 chars). Full design system (color tokens, component API, examples) lives in the builder agent's prompt only.
 
 ### Declarative View-Tree Builder (`agent/builder.py`)
 
@@ -485,6 +520,8 @@ The endpoint awaits the agent task after a terminal `done` or `error` event to d
 ## Schema Discovery
 
 App schemas are fetched on-demand per entity from the frontend (`GET /api/entities/{id}/schema`) via `get_entity_schema`. The agent calls this before `call_entity_tool` to discover what actions an entity supports. No startup caching — each call hits the frontend, which is authoritative.
+
+Both `get_entity_schema` and `call_entity_tool` handle httpx network errors the same way as `create_entity`/`update_entity`: `TimeoutException` → `{"error": "frontend_timeout"}`, `ConnectError` → `{"error": "frontend_unreachable"}`.
 
 ---
 

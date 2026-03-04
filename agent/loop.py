@@ -14,6 +14,17 @@ from agent.usage import Tier, record_usage
 
 logger = get_logger("agent.loop")
 
+# Module-level set to prevent GC of in-flight background tasks
+_bg_tasks: set[asyncio.Task] = set()
+
+
+def _bg(coro) -> asyncio.Task:
+    """Schedule a background coroutine, keeping a reference until it completes."""
+    task = asyncio.create_task(coro)
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+    return task
+
 
 def _build_multimodal_content(context_items: list[dict], message: str) -> list[dict]:
     """Convert context_items (file attachments) + text message into Claude content blocks."""
@@ -277,7 +288,7 @@ async def run_agent(
                         ),
                     },
                 )
-                asyncio.create_task(
+                _bg(
                     record_usage(client, space_id, user_id, "agent_turn", {
                         "input_tokens": getattr(u, "input_tokens", 0),
                         "output_tokens": getattr(u, "output_tokens", 0),
@@ -338,8 +349,22 @@ async def run_agent(
                 *[
                     _timed_execute(tc, params)
                     for tc, params in zip(tool_use_blocks, params_list)
-                ]
+                ],
+                return_exceptions=True,
             )
+
+            # Normalize any exceptions into error dicts so a single tool failure
+            # never aborts the entire batch.
+            normalized = []
+            for tc, result in zip(tool_use_blocks, results):
+                if isinstance(result, Exception):
+                    result = {
+                        "error": "tool_execution_failed",
+                        "tool": tc.name,
+                        "message": str(result),
+                    }
+                normalized.append(result)
+            results = normalized
 
             # Stream tool results
             for tc, result in zip(tool_use_blocks, results):
@@ -382,11 +407,9 @@ async def run_agent(
         # Schedule background memory management
         if tier == Tier.FREE:
             # No Opus budget — silently archive old turns to keep context bounded
-            asyncio.create_task(_maybe_trim_free(client, space_id, user_id))
+            _bg(_maybe_trim_free(client, space_id, user_id))
         else:
-            asyncio.create_task(
-                _maybe_compact(client, anthropic_client, space_id, user_id)
-            )
+            _bg(_maybe_compact(client, anthropic_client, space_id, user_id))
 
         await on_event({"type": "done"})
 

@@ -141,156 +141,102 @@ class TestReadEntity:
 # ---------------------------------------------------------------------------
 
 
+def _make_http_mock(MockClient, status_code=201, json_data=None, text=""):
+    """Helper: wire up a MockClient that returns a canned HTTP response."""
+    mock_resp = MagicMock()
+    mock_resp.status_code = status_code
+    mock_resp.json.return_value = json_data if json_data is not None else {}
+    mock_resp.text = text
+    mock_http = AsyncMock()
+    mock_http.post.return_value = mock_resp
+    mock_http.patch.return_value = mock_resp
+    mock_http.__aenter__ = AsyncMock(return_value=mock_http)
+    mock_http.__aexit__ = AsyncMock(return_value=False)
+    MockClient.return_value = mock_http
+    return mock_http
+
+
 class TestCreateEntityFunction:
-    """Tests for the create_entity tool function."""
+    """create_entity POSTs to Next.js /api/entities."""
 
-    async def test_create_entity_inserts_row(self, mock_supabase, make_entity):
-        """create_entity calls table('entities').insert(row).execute()."""
-        expected = make_entity(entity_type="note", created_by="agent")
-        mock_supabase.set_table_response("entities", [expected])
+    @patch("httpx.AsyncClient")
+    async def test_posts_to_correct_url(self, MockClient):
+        mock_http = _make_http_mock(MockClient, status_code=201, json_data={"id": "ent-1", "type": "note"})
 
-        # Spy on insert to verify the row
-        original_table = mock_supabase.table
+        with patch("config.DOMUS_FRONTEND_URL", "http://test:3000"), \
+             patch("config.DOMUS_SERVICE_TOKEN", "tok-123"):
+            await create_entity(None, TEST_SPACE_ID, TEST_USER_ID, {"type": "note"})
 
-        insert_called_with = {}
+        mock_http.post.assert_called_once()
+        call_args = mock_http.post.call_args
+        assert "/api/entities" in call_args[0][0]
+        assert call_args[1]["params"] == {"space_id": TEST_SPACE_ID}
 
-        def table_spy(name):
-            builder = original_table(name)
-            original_insert = builder.insert
+    @patch("httpx.AsyncClient")
+    async def test_sends_auth_header(self, MockClient):
+        mock_http = _make_http_mock(MockClient, status_code=201, json_data={"id": "ent-1"})
 
-            def insert_capture(*args, **kwargs):
-                insert_called_with.update({"args": args, "kwargs": kwargs})
-                return original_insert(*args, **kwargs)
+        with patch("config.DOMUS_FRONTEND_URL", "http://test:3000"), \
+             patch("config.DOMUS_SERVICE_TOKEN", "tok-secret"):
+            await create_entity(None, TEST_SPACE_ID, TEST_USER_ID, {"type": "note"})
 
-            builder.insert = insert_capture
-            return builder
+        call_args = mock_http.post.call_args
+        assert call_args[1]["headers"]["Authorization"] == "Bearer tok-secret"
 
-        mock_supabase.table = table_spy
+    @patch("httpx.AsyncClient")
+    async def test_request_body_includes_required_fields(self, MockClient):
+        mock_http = _make_http_mock(MockClient, status_code=201, json_data={"id": "ent-1"})
 
-        result = await create_entity(
-            mock_supabase, TEST_SPACE_ID, TEST_USER_ID,
-            {"type": "note", "summary": "A test note"},
-        )
+        with patch("config.DOMUS_FRONTEND_URL", "http://test:3000"), \
+             patch("config.DOMUS_SERVICE_TOKEN", "tok"):
+            await create_entity(
+                None, TEST_SPACE_ID, TEST_USER_ID,
+                {"type": "note", "content": "hello", "summary": "s", "state": {"x": 1}},
+            )
 
-        # Verify insert was called
-        assert "args" in insert_called_with
-        row = insert_called_with["args"][0]
-        assert row["type"] == "note"
-        assert row["space_id"] == TEST_SPACE_ID
-        assert row["user_id"] == TEST_USER_ID
+        body = mock_http.post.call_args[1]["json"]
+        assert body["created_by"] == "agent"
+        assert body["type"] == "note"
+        assert body["content"] == "hello"
+        assert body["summary"] == "s"
+        assert body["state"] == {"x": 1}
 
-    async def test_create_entity_sets_created_by_agent(self, mock_supabase, make_entity):
-        """created_by is always 'agent', regardless of params."""
-        expected = make_entity(entity_type="note", created_by="agent")
-        mock_supabase.set_table_response("entities", [expected])
+    @patch("httpx.AsyncClient")
+    async def test_omits_missing_optional_fields(self, MockClient):
+        mock_http = _make_http_mock(MockClient, status_code=201, json_data={"id": "ent-1"})
 
-        original_table = mock_supabase.table
-        insert_called_with = {}
+        with patch("config.DOMUS_FRONTEND_URL", "http://test:3000"), \
+             patch("config.DOMUS_SERVICE_TOKEN", "tok"):
+            await create_entity(None, TEST_SPACE_ID, TEST_USER_ID, {"type": "note"})
 
-        def table_spy(name):
-            builder = original_table(name)
-            original_insert = builder.insert
+        body = mock_http.post.call_args[1]["json"]
+        assert "content" not in body
+        assert "summary" not in body
+        assert "state" not in body
+        assert "position" not in body
+        assert "size" not in body
 
-            def insert_capture(*args, **kwargs):
-                insert_called_with.update({"args": args})
-                return original_insert(*args, **kwargs)
+    @patch("httpx.AsyncClient")
+    async def test_returns_entity_from_response(self, MockClient):
+        entity = {"id": "ent-42", "type": "note", "state": {}}
+        _make_http_mock(MockClient, status_code=201, json_data=entity)
 
-            builder.insert = insert_capture
-            return builder
+        with patch("config.DOMUS_FRONTEND_URL", "http://test:3000"), \
+             patch("config.DOMUS_SERVICE_TOKEN", "tok"):
+            result = await create_entity(None, TEST_SPACE_ID, TEST_USER_ID, {"type": "note"})
 
-        mock_supabase.table = table_spy
+        assert result == entity
 
-        await create_entity(
-            mock_supabase, TEST_SPACE_ID, TEST_USER_ID,
-            {"type": "note"},
-        )
+    @patch("httpx.AsyncClient")
+    async def test_returns_error_on_non_200(self, MockClient):
+        _make_http_mock(MockClient, status_code=422, text='{"error":"validation_failed"}')
 
-        row = insert_called_with["args"][0]
-        assert row["created_by"] == "agent"
+        with patch("config.DOMUS_FRONTEND_URL", "http://test:3000"), \
+             patch("config.DOMUS_SERVICE_TOKEN", "tok"):
+            result = await create_entity(None, TEST_SPACE_ID, TEST_USER_ID, {"type": "note"})
 
-    async def test_create_entity_uses_default_position_and_size(self, mock_supabase, make_entity):
-        """When position/size not provided, sensible defaults are used."""
-        expected = make_entity(entity_type="note", created_by="agent")
-        mock_supabase.set_table_response("entities", [expected])
-
-        original_table = mock_supabase.table
-        insert_called_with = {}
-
-        def table_spy(name):
-            builder = original_table(name)
-            original_insert = builder.insert
-
-            def insert_capture(*args, **kwargs):
-                insert_called_with.update({"args": args})
-                return original_insert(*args, **kwargs)
-
-            builder.insert = insert_capture
-            return builder
-
-        mock_supabase.table = table_spy
-
-        await create_entity(
-            mock_supabase, TEST_SPACE_ID, TEST_USER_ID,
-            {"type": "note"},
-        )
-
-        row = insert_called_with["args"][0]
-        assert "x" in row["position"]
-        assert "y" in row["position"]
-        assert "width" in row["size"]
-        assert "height" in row["size"]
-
-    async def test_create_entity_returns_full_entity(self, mock_supabase, make_entity):
-        """Return dict has all expected entity fields."""
-        expected = make_entity(
-            entity_type="note",
-            created_by="agent",
-            summary="A test note",
-            state={"title": "Hello"},
-        )
-        mock_supabase.set_table_response("entities", [expected])
-
-        result = await create_entity(
-            mock_supabase, TEST_SPACE_ID, TEST_USER_ID,
-            {"type": "note", "summary": "A test note", "state": {"title": "Hello"}},
-        )
-
-        assert result["id"] == expected["id"]
-        assert result["type"] == expected["type"]
-        assert result["summary"] == expected["summary"]
-        assert result["state"] == expected["state"]
-        assert result["space_id"] == expected["space_id"]
-
-
-    async def test_create_entity_includes_content(self, mock_supabase, make_entity):
-        """content field is passed through to the inserted row."""
-        expected = make_entity(entity_type="note", content="# Hello World")
-        mock_supabase.set_table_response("entities", [expected])
-
-        original_table = mock_supabase.table
-        insert_called_with = {}
-
-        def table_spy(name):
-            builder = original_table(name)
-            original_insert = builder.insert
-
-            def insert_capture(*args, **kwargs):
-                insert_called_with.update({"args": args})
-                return original_insert(*args, **kwargs)
-
-            builder.insert = insert_capture
-            return builder
-
-        mock_supabase.table = table_spy
-
-        result = await create_entity(
-            mock_supabase, TEST_SPACE_ID, TEST_USER_ID,
-            {"type": "note", "content": "# Hello World"},
-        )
-
-        row = insert_called_with["args"][0]
-        assert row["content"] == "# Hello World"
-        assert result["content"] == "# Hello World"
+        assert result["error"] == "create_failed"
+        assert result["status"] == 422
 
 
 class TestReadEntityFunction:
@@ -519,92 +465,83 @@ class TestQueryEntitiesFunction:
 
 
 class TestUpdateEntityFunction:
-    """Tests for the update_entity tool function."""
+    """update_entity PATCHes Next.js /api/entities/{id}."""
 
-    async def test_update_entity_merges_state_adds_new_keys(self, mock_supabase, make_entity):
-        """Patching with a new key adds it to state."""
-        entity = make_entity(state={"title": "Original"})
-        mock_supabase.set_table_response("entities", entity)
+    @patch("httpx.AsyncClient")
+    async def test_patches_correct_url(self, MockClient):
+        mock_http = _make_http_mock(MockClient, status_code=200, json_data={"id": "ent-1"})
 
-        result = await update_entity(
-            mock_supabase, TEST_SPACE_ID, TEST_USER_ID,
-            {"id": entity["id"], "state": {"color": "blue"}},
-        )
+        with patch("config.DOMUS_FRONTEND_URL", "http://test:3000"), \
+             patch("config.DOMUS_SERVICE_TOKEN", "tok-123"):
+            await update_entity(None, TEST_SPACE_ID, TEST_USER_ID, {"id": "ent-1", "summary": "new"})
 
-        # The merged state should have both keys
-        assert result["state"]["title"] == "Original"
-        assert result["state"]["color"] == "blue"
+        mock_http.patch.assert_called_once()
+        call_args = mock_http.patch.call_args
+        assert "/api/entities/ent-1" in call_args[0][0]
+        assert call_args[1]["params"] == {"space_id": TEST_SPACE_ID}
 
-    async def test_update_entity_merges_state_preserves_existing(self, mock_supabase, make_entity):
-        """Patching doesn't remove keys that aren't in the patch."""
-        entity = make_entity(state={"title": "Keep", "body": "Also keep"})
-        mock_supabase.set_table_response("entities", entity)
+    @patch("httpx.AsyncClient")
+    async def test_sends_auth_header(self, MockClient):
+        mock_http = _make_http_mock(MockClient, status_code=200, json_data={"id": "ent-1"})
 
-        result = await update_entity(
-            mock_supabase, TEST_SPACE_ID, TEST_USER_ID,
-            {"id": entity["id"], "state": {"title": "Changed"}},
-        )
+        with patch("config.DOMUS_FRONTEND_URL", "http://test:3000"), \
+             patch("config.DOMUS_SERVICE_TOKEN", "tok-secret"):
+            await update_entity(None, TEST_SPACE_ID, TEST_USER_ID, {"id": "ent-1", "summary": "x"})
 
-        assert result["state"]["title"] == "Changed"
-        assert result["state"]["body"] == "Also keep"
+        call_args = mock_http.patch.call_args
+        assert call_args[1]["headers"]["Authorization"] == "Bearer tok-secret"
 
-    async def test_update_entity_merges_state_null_deletes_key(self, mock_supabase, make_entity):
-        """Setting a key to None in the patch removes it (RFC 7396)."""
-        entity = make_entity(state={"title": "Keep", "obsolete": "Remove me"})
-        mock_supabase.set_table_response("entities", entity)
+    @patch("httpx.AsyncClient")
+    async def test_request_body_includes_only_provided_fields(self, MockClient):
+        mock_http = _make_http_mock(MockClient, status_code=200, json_data={"id": "ent-1"})
 
-        result = await update_entity(
-            mock_supabase, TEST_SPACE_ID, TEST_USER_ID,
-            {"id": entity["id"], "state": {"obsolete": None}},
-        )
+        with patch("config.DOMUS_FRONTEND_URL", "http://test:3000"), \
+             patch("config.DOMUS_SERVICE_TOKEN", "tok"):
+            await update_entity(
+                None, TEST_SPACE_ID, TEST_USER_ID,
+                {"id": "ent-1", "summary": "new", "state": {"x": 1}},
+            )
 
-        assert result["state"]["title"] == "Keep"
-        assert "obsolete" not in result["state"]
+        body = mock_http.patch.call_args[1]["json"]
+        assert body == {"summary": "new", "state": {"x": 1}}
+        assert "id" not in body
 
-    async def test_update_entity_updates_summary(self, mock_supabase, make_entity):
-        """summary field is updated when provided."""
-        entity = make_entity(summary="Old summary")
-        mock_supabase.set_table_response("entities", entity)
+    @patch("httpx.AsyncClient")
+    async def test_returns_entity_from_response(self, MockClient):
+        entity = {"id": "ent-1", "type": "note", "state": {"x": 1}}
+        _make_http_mock(MockClient, status_code=200, json_data=entity)
 
-        result = await update_entity(
-            mock_supabase, TEST_SPACE_ID, TEST_USER_ID,
-            {"id": entity["id"], "summary": "New summary"},
-        )
+        with patch("config.DOMUS_FRONTEND_URL", "http://test:3000"), \
+             patch("config.DOMUS_SERVICE_TOKEN", "tok"):
+            result = await update_entity(None, TEST_SPACE_ID, TEST_USER_ID, {"id": "ent-1", "summary": "new"})
 
-        assert result["summary"] == "New summary"
+        assert result == entity
 
-    async def test_update_entity_updates_content(self, mock_supabase, make_entity):
-        """content field is updated when provided (full replacement, not merge)."""
-        entity = make_entity(content="Old content")
-        mock_supabase.set_table_response("entities", entity)
+    @patch("httpx.AsyncClient")
+    async def test_returns_error_on_non_200(self, MockClient):
+        _make_http_mock(MockClient, status_code=500, text="Internal Server Error")
 
-        result = await update_entity(
-            mock_supabase, TEST_SPACE_ID, TEST_USER_ID,
-            {"id": entity["id"], "content": "New content"},
-        )
+        with patch("config.DOMUS_FRONTEND_URL", "http://test:3000"), \
+             patch("config.DOMUS_SERVICE_TOKEN", "tok"):
+            result = await update_entity(None, TEST_SPACE_ID, TEST_USER_ID, {"id": "ent-1"})
 
-        assert result["content"] == "New content"
+        assert result["error"] == "update_failed"
+        assert result["status"] == 500
 
-    async def test_update_entity_returns_updated_row(self, mock_supabase, make_entity):
-        """Return value has all entity fields after update."""
-        entity = make_entity(
-            entity_type="note",
-            state={"title": "Hello"},
-            summary="A note",
-        )
-        mock_supabase.set_table_response("entities", entity)
+    @patch("httpx.AsyncClient")
+    async def test_returns_409_error_on_folder_has_children(self, MockClient):
+        conflict = {"error": "folder_has_children", "child_ids": ["c1", "c2"], "count": 2}
+        _make_http_mock(MockClient, status_code=409, json_data=conflict)
 
-        result = await update_entity(
-            mock_supabase, TEST_SPACE_ID, TEST_USER_ID,
-            {"id": entity["id"], "state": {"title": "Updated"}, "summary": "Updated note"},
-        )
+        with patch("config.DOMUS_FRONTEND_URL", "http://test:3000"), \
+             patch("config.DOMUS_SERVICE_TOKEN", "tok"):
+            result = await update_entity(
+                None, TEST_SPACE_ID, TEST_USER_ID,
+                {"id": "ent-1", "presentation": "hidden"},
+            )
 
-        # Should have core entity fields
-        assert "id" in result
-        assert "type" in result
-        assert "state" in result
-        assert "summary" in result
-        assert result["state"]["title"] == "Updated"
+        assert result["error"] == "folder_has_children"
+        assert result["count"] == 2
 
 
 # ---------------------------------------------------------------------------
@@ -615,17 +552,17 @@ class TestUpdateEntityFunction:
 class TestExecuteTool:
     """Tests for the execute_tool dispatcher."""
 
-    async def test_dispatch_create_entity(self, mock_supabase, make_entity):
-        """execute_tool('create_entity', ...) routes to create_entity and returns entity data."""
-        expected = make_entity(entity_type="note", created_by="agent")
-        mock_supabase.set_table_response("entities", [expected])
+    @patch("agent.tools.create_entity", new_callable=AsyncMock)
+    async def test_dispatch_create_entity(self, mock_fn):
+        """execute_tool('create_entity', ...) routes to create_entity."""
+        mock_fn.return_value = {"id": "ent-1", "type": "note"}
 
         result = await execute_tool(
-            mock_supabase, "create_entity", {"type": "note"},
+            None, "create_entity", {"type": "note"},
             TEST_SPACE_ID, TEST_USER_ID,
         )
 
-        assert result["id"] == expected["id"]
+        mock_fn.assert_called_once_with(None, TEST_SPACE_ID, TEST_USER_ID, {"type": "note"})
         assert result["type"] == "note"
 
     async def test_dispatch_read_entity(self, mock_supabase, make_entity):
@@ -653,17 +590,18 @@ class TestExecuteTool:
 
         assert "entities" in result
 
-    async def test_dispatch_update_entity(self, mock_supabase, make_entity):
-        """execute_tool('update_entity', ...) routes to update_entity and returns updated data."""
-        entity = make_entity(state={"title": "Original"})
-        mock_supabase.set_table_response("entities", entity)
+    @patch("agent.tools.update_entity", new_callable=AsyncMock)
+    async def test_dispatch_update_entity(self, mock_fn):
+        """execute_tool('update_entity', ...) routes to update_entity."""
+        mock_fn.return_value = {"id": "ent-1", "state": {"title": "Updated"}}
 
         result = await execute_tool(
-            mock_supabase, "update_entity",
-            {"id": entity["id"], "state": {"title": "Updated"}},
+            None, "update_entity",
+            {"id": "ent-1", "state": {"title": "Updated"}},
             TEST_SPACE_ID, TEST_USER_ID,
         )
 
+        mock_fn.assert_called_once()
         assert result["state"]["title"] == "Updated"
 
     async def test_dispatch_unknown_tool_returns_error(self, mock_supabase):
@@ -685,8 +623,9 @@ class TestCreateEntityImageWiring:
     """When type='image' and state.generation_prompt is set, create_entity
     calls generate_image and enriches the entity state."""
 
+    @patch("httpx.AsyncClient")
     @patch("agent.image_gen.generate_image", new_callable=AsyncMock)
-    async def test_image_entity_calls_generate_image(self, mock_gen, mock_supabase, make_entity):
+    async def test_image_entity_calls_generate_image(self, mock_gen, MockClient):
         """create_entity with type='image' + generation_prompt triggers image generation."""
         mock_gen.return_value = {
             "storage_path": f"{TEST_SPACE_ID}/abc.png",
@@ -694,204 +633,175 @@ class TestCreateEntityImageWiring:
             "width": 1024,
             "height": 1024,
         }
-        expected = make_entity(
-            entity_type="image",
-            presentation="card",
-            state={
-                "generation_prompt": "a sunset",
-                "image_url": "https://test.supabase.co/storage/v1/object/public/images/abc.png",
-                "width": 1024,
-                "height": 1024,
-            },
-            created_by="agent",
-        )
-        mock_supabase.set_table_response("entities", [expected])
+        _make_http_mock(MockClient, status_code=201, json_data={"id": "ent-1", "type": "image"})
 
-        result = await create_entity(
-            mock_supabase, TEST_SPACE_ID, TEST_USER_ID,
-            {"type": "image", "state": {"generation_prompt": "a sunset"}},
-        )
+        with patch("config.DOMUS_FRONTEND_URL", "http://test:3000"), \
+             patch("config.DOMUS_SERVICE_TOKEN", "tok"):
+            await create_entity(
+                None, TEST_SPACE_ID, TEST_USER_ID,
+                {"type": "image", "state": {"generation_prompt": "a sunset"}},
+            )
 
-        mock_gen.assert_called_once_with("a sunset", TEST_SPACE_ID, mock_supabase, TEST_USER_ID)
+        mock_gen.assert_called_once_with("a sunset", TEST_SPACE_ID, None, TEST_USER_ID)
 
+    @patch("httpx.AsyncClient")
     @patch("agent.image_gen.generate_image", new_callable=AsyncMock)
-    async def test_image_entity_enriches_state(self, mock_gen, mock_supabase, make_entity):
-        """State should include image_url, width, height from generate_image result."""
+    async def test_image_entity_enriches_state(self, mock_gen, MockClient):
+        """State POSTed to frontend includes image_url, width, height from generate_image."""
         mock_gen.return_value = {
             "storage_path": f"{TEST_SPACE_ID}/abc.png",
             "public_url": "https://example.com/image.png",
             "width": 512,
             "height": 768,
         }
+        mock_http = _make_http_mock(MockClient, status_code=201, json_data={"id": "ent-1"})
 
-        insert_called_with = {}
-        original_table = mock_supabase.table
+        with patch("config.DOMUS_FRONTEND_URL", "http://test:3000"), \
+             patch("config.DOMUS_SERVICE_TOKEN", "tok"):
+            await create_entity(
+                None, TEST_SPACE_ID, TEST_USER_ID,
+                {"type": "image", "state": {"generation_prompt": "a cat"}},
+            )
 
-        def table_spy(name):
-            builder = original_table(name)
-            original_insert = builder.insert
+        body = mock_http.post.call_args[1]["json"]
+        assert body["state"]["image_url"] == "https://example.com/image.png"
+        assert body["state"]["width"] == 512
+        assert body["state"]["height"] == 768
+        assert body["state"]["generation_prompt"] == "a cat"
 
-            def insert_capture(*args, **kwargs):
-                insert_called_with.update({"args": args})
-                return original_insert(*args, **kwargs)
-
-            builder.insert = insert_capture
-            return builder
-
-        mock_supabase.table = table_spy
-
-        expected = make_entity(entity_type="image", created_by="agent")
-        mock_supabase.set_table_response("entities", [expected])
-
-        await create_entity(
-            mock_supabase, TEST_SPACE_ID, TEST_USER_ID,
-            {"type": "image", "state": {"generation_prompt": "a cat"}},
-        )
-
-        row = insert_called_with["args"][0]
-        assert row["state"]["image_url"] == "https://example.com/image.png"
-        assert row["state"]["width"] == 512
-        assert row["state"]["height"] == 768
-        assert row["state"]["generation_prompt"] == "a cat"
-
+    @patch("httpx.AsyncClient")
     @patch("agent.image_gen.generate_image", new_callable=AsyncMock)
-    async def test_image_entity_defaults_presentation_to_card(self, mock_gen, mock_supabase, make_entity):
-        """Image entities default to presentation='card' (not 'window')."""
-        mock_gen.return_value = {
-            "storage_path": f"{TEST_SPACE_ID}/abc.png",
-            "public_url": "https://example.com/image.png",
-            "width": 1024,
-            "height": 1024,
-        }
-
-        insert_called_with = {}
-        original_table = mock_supabase.table
-
-        def table_spy(name):
-            builder = original_table(name)
-            original_insert = builder.insert
-
-            def insert_capture(*args, **kwargs):
-                insert_called_with.update({"args": args})
-                return original_insert(*args, **kwargs)
-
-            builder.insert = insert_capture
-            return builder
-
-        mock_supabase.table = table_spy
-
-        expected = make_entity(entity_type="image", created_by="agent")
-        mock_supabase.set_table_response("entities", [expected])
-
-        await create_entity(
-            mock_supabase, TEST_SPACE_ID, TEST_USER_ID,
-            {"type": "image", "state": {"generation_prompt": "landscape"}},
-        )
-
-        row = insert_called_with["args"][0]
-        assert row["presentation"] == "card"
-
-    @patch("agent.image_gen.generate_image", new_callable=AsyncMock)
-    async def test_image_entity_defaults_size(self, mock_gen, mock_supabase, make_entity):
-        """Image entities default to size 232x300."""
-        mock_gen.return_value = {
-            "storage_path": f"{TEST_SPACE_ID}/abc.png",
-            "public_url": "https://example.com/image.png",
-            "width": 1024,
-            "height": 1024,
-        }
-
-        insert_called_with = {}
-        original_table = mock_supabase.table
-
-        def table_spy(name):
-            builder = original_table(name)
-            original_insert = builder.insert
-
-            def insert_capture(*args, **kwargs):
-                insert_called_with.update({"args": args})
-                return original_insert(*args, **kwargs)
-
-            builder.insert = insert_capture
-            return builder
-
-        mock_supabase.table = table_spy
-
-        expected = make_entity(entity_type="image", created_by="agent")
-        mock_supabase.set_table_response("entities", [expected])
-
-        await create_entity(
-            mock_supabase, TEST_SPACE_ID, TEST_USER_ID,
-            {"type": "image", "state": {"generation_prompt": "abstract art"}},
-        )
-
-        row = insert_called_with["args"][0]
-        assert row["size"] == {"width": 232, "height": 300}
-
-    @patch("agent.image_gen.generate_image", new_callable=AsyncMock)
-    async def test_image_entity_failure_sets_generation_error(self, mock_gen, mock_supabase, make_entity):
+    async def test_image_entity_failure_sets_generation_error(self, mock_gen, MockClient):
         """On generate_image failure, entity is still created with generation_error in state."""
         mock_gen.side_effect = RuntimeError("Gemini API failed")
+        mock_http = _make_http_mock(MockClient, status_code=201, json_data={"id": "ent-1"})
 
-        insert_called_with = {}
-        original_table = mock_supabase.table
+        with patch("config.DOMUS_FRONTEND_URL", "http://test:3000"), \
+             patch("config.DOMUS_SERVICE_TOKEN", "tok"):
+            await create_entity(
+                None, TEST_SPACE_ID, TEST_USER_ID,
+                {"type": "image", "state": {"generation_prompt": "failing prompt"}},
+            )
 
-        def table_spy(name):
-            builder = original_table(name)
-            original_insert = builder.insert
+        body = mock_http.post.call_args[1]["json"]
+        assert "generation_error" in body["state"]
+        assert "Gemini API failed" in body["state"]["generation_error"]
+        assert "image_url" not in body["state"]
 
-            def insert_capture(*args, **kwargs):
-                insert_called_with.update({"args": args})
-                return original_insert(*args, **kwargs)
-
-            builder.insert = insert_capture
-            return builder
-
-        mock_supabase.table = table_spy
-
-        expected = make_entity(entity_type="image", created_by="agent")
-        mock_supabase.set_table_response("entities", [expected])
-
-        result = await create_entity(
-            mock_supabase, TEST_SPACE_ID, TEST_USER_ID,
-            {"type": "image", "state": {"generation_prompt": "failing prompt"}},
-        )
-
-        row = insert_called_with["args"][0]
-        assert "generation_error" in row["state"]
-        assert "Gemini API failed" in row["state"]["generation_error"]
-        # image_url should NOT be in state on failure
-        assert "image_url" not in row["state"]
-
+    @patch("httpx.AsyncClient")
     @patch("agent.image_gen.generate_image", new_callable=AsyncMock)
-    async def test_non_image_entity_does_not_trigger_generation(self, mock_gen, mock_supabase, make_entity):
+    async def test_non_image_entity_does_not_trigger_generation(self, mock_gen, MockClient):
         """create_entity with type='note' should not call generate_image."""
-        expected = make_entity(entity_type="note", created_by="agent")
-        mock_supabase.set_table_response("entities", [expected])
+        _make_http_mock(MockClient, status_code=201, json_data={"id": "ent-1"})
 
-        await create_entity(
-            mock_supabase, TEST_SPACE_ID, TEST_USER_ID,
-            {"type": "note", "state": {"title": "Hello"}},
-        )
+        with patch("config.DOMUS_FRONTEND_URL", "http://test:3000"), \
+             patch("config.DOMUS_SERVICE_TOKEN", "tok"):
+            await create_entity(
+                None, TEST_SPACE_ID, TEST_USER_ID,
+                {"type": "note", "state": {"title": "Hello"}},
+            )
 
         mock_gen.assert_not_called()
 
+    @patch("httpx.AsyncClient")
     @patch("agent.image_gen.generate_image", new_callable=AsyncMock)
-    async def test_image_without_generation_prompt_skips_generation(self, mock_gen, mock_supabase, make_entity):
+    async def test_image_without_generation_prompt_skips_generation(self, mock_gen, MockClient):
         """Image entity without generation_prompt should not trigger generation."""
-        expected = make_entity(entity_type="image", created_by="agent")
-        mock_supabase.set_table_response("entities", [expected])
+        _make_http_mock(MockClient, status_code=201, json_data={"id": "ent-1"})
 
-        await create_entity(
-            mock_supabase, TEST_SPACE_ID, TEST_USER_ID,
-            {"type": "image", "state": {"image_url": "https://existing.com/img.png"}},
-        )
+        with patch("config.DOMUS_FRONTEND_URL", "http://test:3000"), \
+             patch("config.DOMUS_SERVICE_TOKEN", "tok"):
+            await create_entity(
+                None, TEST_SPACE_ID, TEST_USER_ID,
+                {"type": "image", "state": {"image_url": "https://existing.com/img.png"}},
+            )
 
         mock_gen.assert_not_called()
 
 
-# ---------------------------------------------------------------------------
-# compute_group_positions tests
+class TestCreateEntityInternalTypesBypass:
+    """Internal entity types bypass the frontend and insert directly to Supabase."""
+
+    def _make_supabase_with_insert(self):
+        """Return a mock Supabase client that records insert calls."""
+        inserted = []
+
+        class _QB:
+            def insert(self, row):
+                inserted.append(row)
+                return self
+
+            def eq(self, *a, **kw):
+                return self
+
+            async def execute(self):
+                result = MagicMock()
+                result.data = [{"id": "ent-new", **inserted[-1]}] if inserted else []
+                return result
+
+        class _Client:
+            def table(self, name):
+                return _QB()
+
+        return _Client(), inserted
+
+    @patch("httpx.AsyncClient")
+    async def test_internal_type_inserts_direct_to_supabase(self, MockClient):
+        """conversation_turn → Supabase insert is called, httpx is NOT called."""
+        mock_http = _make_http_mock(MockClient, status_code=201, json_data={"id": "ent-1"})
+        client, inserted = self._make_supabase_with_insert()
+
+        await create_entity(client, TEST_SPACE_ID, TEST_USER_ID, {"type": "conversation_turn"})
+
+        mock_http.post.assert_not_called()
+        assert len(inserted) == 1
+
+    @patch("httpx.AsyncClient")
+    async def test_internal_type_always_sets_presentation_hidden(self, MockClient):
+        """Inserted row for internal type always has presentation='hidden'."""
+        _make_http_mock(MockClient, status_code=201, json_data={"id": "ent-1"})
+        client, inserted = self._make_supabase_with_insert()
+
+        await create_entity(
+            client, TEST_SPACE_ID, TEST_USER_ID,
+            {"type": "fact", "presentation": "window"},  # caller tries to override — must be ignored
+        )
+
+        assert inserted[0]["presentation"] == "hidden"
+
+    @patch("httpx.AsyncClient")
+    async def test_user_facing_type_posts_to_frontend(self, MockClient):
+        """note type → httpx POST is called, Supabase insert is NOT called."""
+        mock_http = _make_http_mock(MockClient, status_code=201, json_data={"id": "ent-1"})
+        client, inserted = self._make_supabase_with_insert()
+
+        with patch("config.DOMUS_FRONTEND_URL", "http://test:3000"), \
+             patch("config.DOMUS_SERVICE_TOKEN", "tok"):
+            await create_entity(client, TEST_SPACE_ID, TEST_USER_ID, {"type": "note"})
+
+        mock_http.post.assert_called_once()
+        assert len(inserted) == 0
+
+    @pytest.mark.parametrize("entity_type", [
+        "conversation_turn",
+        "conversation_summary",
+        "fact",
+        "personality_trait",
+        "edge",
+    ])
+    @patch("httpx.AsyncClient")
+    async def test_all_internal_types_bypass_frontend(self, MockClient, entity_type):
+        """All 5 internal types insert directly to Supabase without calling httpx."""
+        mock_http = _make_http_mock(MockClient, status_code=201, json_data={"id": "ent-1"})
+        client, inserted = self._make_supabase_with_insert()
+
+        await create_entity(client, TEST_SPACE_ID, TEST_USER_ID, {"type": entity_type})
+
+        mock_http.post.assert_not_called()
+        assert len(inserted) == 1
+        assert inserted[0]["presentation"] == "hidden"
+
+
 # ---------------------------------------------------------------------------
 
 
@@ -1339,3 +1249,327 @@ class TestWebSearch:
 
         assert result.get("error") != "unknown_tool"
         assert "answer" in result
+
+
+# ---------------------------------------------------------------------------
+# TestPerplexityValidation
+# ---------------------------------------------------------------------------
+
+
+class TestPerplexityValidation:
+    """web_search validates Perplexity response shape before accessing nested keys."""
+
+    @patch("httpx.AsyncClient")
+    async def test_web_search_handles_empty_choices(self, MockClient):
+        """Returns error dict when Perplexity responds with an empty choices list."""
+        from agent.tools import web_search
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"choices": [], "citations": []}
+        mock_http = AsyncMock()
+        mock_http.post.return_value = mock_resp
+        mock_http.__aenter__ = AsyncMock(return_value=mock_http)
+        mock_http.__aexit__ = AsyncMock(return_value=False)
+        MockClient.return_value = mock_http
+
+        with patch("config.PERPLEXITY_API_KEY", "pplx-test-key"):
+            result = await web_search(
+                None, TEST_SPACE_ID, TEST_USER_ID, {"query": "test"}
+            )
+
+        assert result["error"] == "web_search_failed"
+        assert "message" in result
+
+    @patch("httpx.AsyncClient")
+    async def test_web_search_handles_missing_choices_key(self, MockClient):
+        """Returns error dict when Perplexity responds without a 'choices' key."""
+        from agent.tools import web_search
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {}  # no choices key at all
+        mock_http = AsyncMock()
+        mock_http.post.return_value = mock_resp
+        mock_http.__aenter__ = AsyncMock(return_value=mock_http)
+        mock_http.__aexit__ = AsyncMock(return_value=False)
+        MockClient.return_value = mock_http
+
+        with patch("config.PERPLEXITY_API_KEY", "pplx-test-key"):
+            result = await web_search(
+                None, TEST_SPACE_ID, TEST_USER_ID, {"query": "test"}
+            )
+
+        assert result["error"] == "web_search_failed"
+
+    @patch("httpx.AsyncClient")
+    async def test_create_entity_handles_timeout(self, MockClient):
+        """create_entity returns a clean error dict on httpx.TimeoutException."""
+        import httpx as _httpx
+
+        mock_http = AsyncMock()
+        mock_http.post.side_effect = _httpx.TimeoutException("Connection timed out")
+        mock_http.__aenter__ = AsyncMock(return_value=mock_http)
+        mock_http.__aexit__ = AsyncMock(return_value=False)
+        MockClient.return_value = mock_http
+
+        with patch("config.DOMUS_FRONTEND_URL", "http://test:3000"), \
+             patch("config.DOMUS_SERVICE_TOKEN", "tok"):
+            result = await create_entity(
+                None, TEST_SPACE_ID, TEST_USER_ID, {"type": "note"}
+            )
+
+        assert result["error"] == "frontend_timeout"
+        assert result["tool"] == "create_entity"
+
+
+class TestGetEntitySchemaHttpxErrors:
+    """get_entity_schema handles httpx network errors gracefully."""
+
+    @patch("httpx.AsyncClient")
+    async def test_get_entity_schema_handles_timeout(self, MockClient):
+        """get_entity_schema returns a clean error dict on httpx.TimeoutException."""
+        import httpx as _httpx
+        from agent.tools import get_entity_schema
+
+        mock_http = AsyncMock()
+        mock_http.get.side_effect = _httpx.TimeoutException("timed out")
+        mock_http.__aenter__ = AsyncMock(return_value=mock_http)
+        mock_http.__aexit__ = AsyncMock(return_value=False)
+        MockClient.return_value = mock_http
+
+        with patch("config.DOMUS_FRONTEND_URL", "http://test:3000"), \
+             patch("config.DOMUS_SERVICE_TOKEN", "tok"):
+            result = await get_entity_schema(
+                None, TEST_SPACE_ID, TEST_USER_ID, {"entity_id": "ent-1"}
+            )
+
+        assert result["error"] == "frontend_timeout"
+        assert result["tool"] == "get_entity_schema"
+
+    @patch("httpx.AsyncClient")
+    async def test_get_entity_schema_handles_connect_error(self, MockClient):
+        """get_entity_schema returns a clean error dict on httpx.ConnectError."""
+        import httpx as _httpx
+        from agent.tools import get_entity_schema
+
+        mock_http = AsyncMock()
+        mock_http.get.side_effect = _httpx.ConnectError("connection refused")
+        mock_http.__aenter__ = AsyncMock(return_value=mock_http)
+        mock_http.__aexit__ = AsyncMock(return_value=False)
+        MockClient.return_value = mock_http
+
+        with patch("config.DOMUS_FRONTEND_URL", "http://test:3000"), \
+             patch("config.DOMUS_SERVICE_TOKEN", "tok"):
+            result = await get_entity_schema(
+                None, TEST_SPACE_ID, TEST_USER_ID, {"entity_id": "ent-1"}
+            )
+
+        assert result["error"] == "frontend_unreachable"
+        assert result["tool"] == "get_entity_schema"
+
+
+class TestCallEntityToolHttpxErrors:
+    """call_entity_tool handles httpx network errors gracefully."""
+
+    @patch("httpx.AsyncClient")
+    async def test_call_entity_tool_handles_timeout(self, MockClient):
+        """call_entity_tool returns a clean error dict on httpx.TimeoutException."""
+        import httpx as _httpx
+        from agent.tools import call_entity_tool
+
+        mock_http = AsyncMock()
+        mock_http.post.side_effect = _httpx.TimeoutException("timed out")
+        mock_http.__aenter__ = AsyncMock(return_value=mock_http)
+        mock_http.__aexit__ = AsyncMock(return_value=False)
+        MockClient.return_value = mock_http
+
+        with patch("config.DOMUS_FRONTEND_URL", "http://test:3000"), \
+             patch("config.DOMUS_SERVICE_TOKEN", "tok"):
+            result = await call_entity_tool(
+                None, TEST_SPACE_ID, TEST_USER_ID,
+                {"entity_id": "ent-1", "tool_name": "add_item", "params": {}}
+            )
+
+        assert result["error"] == "frontend_timeout"
+        assert result["tool"] == "call_entity_tool"
+
+    @patch("httpx.AsyncClient")
+    async def test_call_entity_tool_handles_connect_error(self, MockClient):
+        """call_entity_tool returns a clean error dict on httpx.ConnectError."""
+        import httpx as _httpx
+        from agent.tools import call_entity_tool
+
+        mock_http = AsyncMock()
+        mock_http.post.side_effect = _httpx.ConnectError("connection refused")
+        mock_http.__aenter__ = AsyncMock(return_value=mock_http)
+        mock_http.__aexit__ = AsyncMock(return_value=False)
+        MockClient.return_value = mock_http
+
+        with patch("config.DOMUS_FRONTEND_URL", "http://test:3000"), \
+             patch("config.DOMUS_SERVICE_TOKEN", "tok"):
+            result = await call_entity_tool(
+                None, TEST_SPACE_ID, TEST_USER_ID,
+                {"entity_id": "ent-1", "tool_name": "add_item", "params": {}}
+            )
+
+        assert result["error"] == "frontend_unreachable"
+        assert result["tool"] == "call_entity_tool"
+
+
+# ---------------------------------------------------------------------------
+# Cache invalidation tests
+# ---------------------------------------------------------------------------
+
+
+from agent.tools import build_app, update_app, call_entity_tool
+
+_INVALIDATE_PATH = "agent.tools._cache_invalidate"
+
+
+class TestEntityIndexCacheInvalidation:
+    """Mutating tools call _cache_invalidate(entity_index:<space_id>) so the next
+    prompt build sees the updated entity list immediately — no 60-second stale window."""
+
+    EXPECTED_KEY = f"entity_index:{TEST_SPACE_ID}"
+
+    # --- create_entity (internal type → Supabase) ---
+
+    @patch("httpx.AsyncClient")
+    async def test_create_internal_type_invalidates_cache(self, MockClient):
+        """create_entity for internal types (fact, etc.) invalidates the entity index cache."""
+        _make_http_mock(MockClient, status_code=201, json_data={})
+
+        class _QB:
+            def insert(self, row): return self
+            async def execute(self): return MagicMock(data=[{"id": "new-1"}])
+
+        class _Client:
+            def table(self, _): return _QB()
+
+        with patch(_INVALIDATE_PATH) as mock_inv:
+            await create_entity(_Client(), TEST_SPACE_ID, TEST_USER_ID, {"type": "fact"})
+
+        mock_inv.assert_called_once_with(self.EXPECTED_KEY)
+
+    # --- create_entity (user-facing type → frontend POST) ---
+
+    @patch("httpx.AsyncClient")
+    async def test_create_user_facing_type_invalidates_cache(self, MockClient):
+        """create_entity for user-facing types (note, image, etc.) invalidates on success."""
+        _make_http_mock(MockClient, status_code=201, json_data={"id": "new-2"})
+
+        with patch(_INVALIDATE_PATH) as mock_inv, \
+             patch("config.DOMUS_FRONTEND_URL", "http://test:3000"), \
+             patch("config.DOMUS_SERVICE_TOKEN", "tok"):
+            await create_entity(None, TEST_SPACE_ID, TEST_USER_ID, {"type": "note"})
+
+        mock_inv.assert_called_once_with(self.EXPECTED_KEY)
+
+    @patch("httpx.AsyncClient")
+    async def test_create_user_facing_type_failure_does_not_invalidate(self, MockClient):
+        """create_entity on non-200 response does NOT invalidate the cache."""
+        _make_http_mock(MockClient, status_code=500, json_data={})
+
+        with patch(_INVALIDATE_PATH) as mock_inv, \
+             patch("config.DOMUS_FRONTEND_URL", "http://test:3000"), \
+             patch("config.DOMUS_SERVICE_TOKEN", "tok"):
+            await create_entity(None, TEST_SPACE_ID, TEST_USER_ID, {"type": "note"})
+
+        mock_inv.assert_not_called()
+
+    # --- update_entity (covers deletion: archived=True) ---
+
+    @patch("httpx.AsyncClient")
+    async def test_update_entity_invalidates_cache(self, MockClient):
+        """update_entity on success (including archived=True / deletion) invalidates cache."""
+        _make_http_mock(MockClient, status_code=200, json_data={"id": "ent-1"})
+
+        with patch(_INVALIDATE_PATH) as mock_inv, \
+             patch("config.DOMUS_FRONTEND_URL", "http://test:3000"), \
+             patch("config.DOMUS_SERVICE_TOKEN", "tok"):
+            await update_entity(None, TEST_SPACE_ID, TEST_USER_ID,
+                                {"id": "ent-1", "archived": True})
+
+        mock_inv.assert_called_once_with(self.EXPECTED_KEY)
+
+    @patch("httpx.AsyncClient")
+    async def test_update_entity_failure_does_not_invalidate(self, MockClient):
+        """update_entity on non-200 response does NOT invalidate the cache."""
+        _make_http_mock(MockClient, status_code=500, json_data={})
+
+        with patch(_INVALIDATE_PATH) as mock_inv, \
+             patch("config.DOMUS_FRONTEND_URL", "http://test:3000"), \
+             patch("config.DOMUS_SERVICE_TOKEN", "tok"):
+            await update_entity(None, TEST_SPACE_ID, TEST_USER_ID,
+                                {"id": "ent-1", "summary": "new"})
+
+        mock_inv.assert_not_called()
+
+    # --- build_app ---
+
+    async def test_build_app_invalidates_cache(self):
+        """build_app invalidates the entity index cache after Supabase insert."""
+        class _QB:
+            def insert(self, row): return self
+            async def execute(self): return MagicMock(data=[{"id": "app-1"}])
+
+        class _Client:
+            def table(self, _): return _QB()
+
+        with patch(_INVALIDATE_PATH) as mock_inv:
+            await build_app(_Client(), TEST_SPACE_ID, TEST_USER_ID, {
+                "name": "Test", "icon": "box", "description": "d",
+                "code": "function App(){}", "schema": [], "initial_state": {},
+            })
+
+        mock_inv.assert_called_once_with(self.EXPECTED_KEY)
+
+    # --- update_app ---
+
+    async def test_update_app_invalidates_cache(self):
+        """update_app invalidates the entity index cache after Supabase update."""
+        class _QB:
+            def __init__(self): self._data = {"id": "app-1", "state": {}}
+            def select(self, *a): return self
+            def update(self, *a): return self
+            def eq(self, *a): return self
+            def maybe_single(self): return self
+            async def execute(self): return MagicMock(data=self._data)
+
+        class _Client:
+            def table(self, _): return _QB()
+
+        with patch(_INVALIDATE_PATH) as mock_inv:
+            await update_app(_Client(), TEST_SPACE_ID, TEST_USER_ID,
+                             {"entity_id": "app-1", "code": "function App(){return null}"})
+
+        mock_inv.assert_called_once_with(self.EXPECTED_KEY)
+
+    # --- call_entity_tool ---
+
+    @patch("httpx.AsyncClient")
+    async def test_call_entity_tool_invalidates_cache(self, MockClient):
+        """call_entity_tool on success invalidates the entity index cache."""
+        _make_http_mock(MockClient, status_code=200, json_data={"state": {}})
+
+        with patch(_INVALIDATE_PATH) as mock_inv, \
+             patch("config.DOMUS_FRONTEND_URL", "http://test:3000"), \
+             patch("config.DOMUS_SERVICE_TOKEN", "tok"):
+            await call_entity_tool(None, TEST_SPACE_ID, TEST_USER_ID,
+                                   {"entity_id": "ent-1", "tool_name": "do_thing"})
+
+        mock_inv.assert_called_once_with(self.EXPECTED_KEY)
+
+    @patch("httpx.AsyncClient")
+    async def test_call_entity_tool_failure_does_not_invalidate(self, MockClient):
+        """call_entity_tool on non-200 does NOT invalidate the cache."""
+        _make_http_mock(MockClient, status_code=500, json_data={})
+
+        with patch(_INVALIDATE_PATH) as mock_inv, \
+             patch("config.DOMUS_FRONTEND_URL", "http://test:3000"), \
+             patch("config.DOMUS_SERVICE_TOKEN", "tok"):
+            await call_entity_tool(None, TEST_SPACE_ID, TEST_USER_ID,
+                                   {"entity_id": "ent-1", "tool_name": "do_thing"})
+
+        mock_inv.assert_not_called()

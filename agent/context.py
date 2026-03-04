@@ -15,25 +15,29 @@ from agent.prompts.iframe_builder import IFRAME_BUILDER_CONTEXT
 # ---------------------------------------------------------------------------
 
 _cache: dict[str, tuple[float, float, Any]] = {}  # key -> (stored_at, ttl, value)
+_cache_lock = asyncio.Lock()
 
 
-def _cache_get(key: str) -> Any | None:
+async def _cache_get(key: str) -> Any | None:
     """Return cached value if still valid, else None."""
-    entry = _cache.get(key)
-    if entry and time.monotonic() - entry[0] < entry[1]:
-        return entry[2]
-    _cache.pop(key, None)
-    return None
+    async with _cache_lock:
+        entry = _cache.get(key)
+        if entry and time.monotonic() - entry[0] < entry[1]:
+            return entry[2]
+        _cache.pop(key, None)
+        return None
 
 
-def _cache_set(key: str, val: Any, ttl: float = 60.0) -> None:
+async def _cache_set(key: str, val: Any, ttl: float = 60.0) -> None:
     """Store value in cache with TTL in seconds."""
-    _cache[key] = (time.monotonic(), ttl, val)
+    async with _cache_lock:
+        _cache[key] = (time.monotonic(), ttl, val)
 
 
-def _cache_invalidate(key: str) -> None:
+async def _cache_invalidate(key: str) -> None:
     """Remove a key from the cache."""
-    _cache.pop(key, None)
+    async with _cache_lock:
+        _cache.pop(key, None)
 
 
 # ---------------------------------------------------------------------------
@@ -62,16 +66,37 @@ async def _noop() -> None:
     return None
 
 
+# Internal memory types — never surfaced in the entity index.
+# User-created entities (app, note, image, calendar, …) are always included
+# regardless of presentation so the agent sees docked/hidden apps too.
+_INTERNAL_ENTITY_TYPES = frozenset({
+    "conversation_turn",
+    "conversation_summary",
+    "fact",
+    "edge",
+    "personality_trait",
+})
+
+# Types that have no valid hidden/docked state.
+# If an entity of these types has presentation='hidden', it's a bug — exclude it.
+# App-like types (calendar, composed, sounds, etc.) may be legitimately docked.
+_TYPES_WITHOUT_HIDDEN_STATE = frozenset({
+    "image",
+    "folder",
+    "note",
+})
+
+
 async def get_entity_index(client, space_id: str) -> list[dict]:
-    """Get all non-archived, non-hidden entities for the space.
+    """Get all non-archived user-facing entities for the space.
 
     Returns: list of {id, type, presentation, z_index, summary}
-    Hidden entities (presentation='hidden') are excluded — they inflate
-    the index with internal state (turns, facts, edges) not useful to Claude.
+    Internal memory types (turns, facts, edges, traits, summaries) are excluded.
+    User-created entities are always included — even hidden ones (docked apps).
     Cached for 60 seconds to avoid re-querying on every tool-loop iteration.
     """
     cache_key = f"entity_index:{space_id}"
-    cached = _cache_get(cache_key)
+    cached = await _cache_get(cache_key)
     if cached is not None:
         return cached
 
@@ -80,11 +105,17 @@ async def get_entity_index(client, space_id: str) -> list[dict]:
         .select("id, type, presentation, z_index, summary, updated_at, created_at")
         .eq("space_id", space_id)
         .eq("archived", False)
-        .neq("presentation", "hidden")
         .execute()
     )
-    entities = result.data or []
-    _cache_set(cache_key, entities, ttl=60.0)
+    entities = [
+        e for e in (result.data or [])
+        if e.get("type") not in _INTERNAL_ENTITY_TYPES
+        and not (
+            e.get("presentation") == "hidden"
+            and e.get("type") in _TYPES_WITHOUT_HIDDEN_STATE
+        )
+    ]
+    await _cache_set(cache_key, entities, ttl=60.0)
     return entities
 
 
@@ -114,7 +145,7 @@ async def get_user_profile(client, user_id: str) -> dict | None:
     Cached for 300 seconds.
     """
     cache_key = f"user_profile:{user_id}"
-    cached = _cache_get(cache_key)
+    cached = await _cache_get(cache_key)
     if cached is not None:
         return cached
 
@@ -126,7 +157,7 @@ async def get_user_profile(client, user_id: str) -> dict | None:
         .execute()
     )
     data = result.data
-    _cache_set(cache_key, data, ttl=300.0)
+    await _cache_set(cache_key, data, ttl=300.0)
     return data
 
 
@@ -137,7 +168,7 @@ async def get_space_info(client, space_id: str) -> dict | None:
     Cached for 300 seconds.
     """
     cache_key = f"space_info:{space_id}"
-    cached = _cache_get(cache_key)
+    cached = await _cache_get(cache_key)
     if cached is not None:
         return cached
 
@@ -149,7 +180,7 @@ async def get_space_info(client, space_id: str) -> dict | None:
         .execute()
     )
     data = result.data
-    _cache_set(cache_key, data, ttl=300.0)
+    await _cache_set(cache_key, data, ttl=300.0)
     return data
 
 
@@ -175,10 +206,10 @@ async def get_conversation_summaries(client, space_id: str) -> list[str]:
     ]
 
 
-async def get_personality_traits(client, space_id: str) -> list[str]:
+async def get_personality_traits(client, space_id: str) -> list[dict]:
     """Get personality traits for the space.
 
-    Returns: list of trait content strings from personality_trait entities.
+    Returns: list of {content, confidence} dicts from personality_trait entities.
     """
     result = await (
         client.table("entities")
@@ -190,7 +221,10 @@ async def get_personality_traits(client, space_id: str) -> list[str]:
     )
     data = result.data or []
     return [
-        r["state"]["content"]
+        {
+            "content": r["state"]["content"],
+            "confidence": r["state"].get("confidence", 1.0),
+        }
         for r in data
         if r.get("state") and r["state"].get("content")
     ]
@@ -271,7 +305,9 @@ You can create any kind of entity. Set the presentation at creation time:
 - window: draggable canvas window
 - card: compact canvas card
 - folder: grouped entity stack
-- hidden: not rendered on canvas
+- hidden: minimized/docked — not visible on canvas but still exists
+
+Apps with presentation='hidden' are docked. To open a docked app, update its presentation to 'window'.
 
 When uncertain about an entity's expected shape, look at similar entities already in the space.
 
@@ -288,7 +324,7 @@ def _build_semi_static_block(
     user: dict | None,
     entities: list[dict],
     summaries: list[str] | None = None,
-    traits: list[str] | None = None,
+    traits: list[dict] | None = None,
     user_facts: list[dict] | None = None,
 ) -> str:
     """Build block 1: space name, user profile, entity index, conversation history."""
@@ -299,6 +335,8 @@ def _build_semi_static_block(
 
     if user and user.get("name"):
         user_section = f"=== User ===\nThe user's name is {user['name']}."
+        if user.get("username"):
+            user_section += f" Their username is {user['username']}."
         if user_facts:
             facts_bullets = "\n".join(f"- {f['content']}" for f in user_facts)
             user_section += f"\n\nKnown facts about this user:\n{facts_bullets}"
@@ -309,7 +347,9 @@ def _build_semi_static_block(
         parts.append(f"=== Conversation History ===\n{summary_lines}")
 
     if traits:
-        trait_bullets = "\n".join(f"- {t}" for t in traits)
+        trait_bullets = "\n".join(
+            f"- {t['content']} (confidence: {t['confidence']})" for t in traits
+        )
         parts.append(f"=== Agent Personality ===\n{trait_bullets}")
 
     if entities:

@@ -13,7 +13,7 @@ from pydantic import BaseModel
 import config as cfg
 from agent.logging import setup_logging, get_logger
 from agent.loop import run_agent, format_sse_event
-from agent.usage import check_quota, check_rate_limit, get_user_tier
+from agent.usage import check_quota, check_rate_limit, get_user_tier, acquire_turn_slot, release_turn_slot
 from agent.context import (
     build_system_prompt,
     get_entity_index,
@@ -26,6 +26,7 @@ from agent.context import (
     SESSION_WINDOW_MINUTES,
     _BASE_INSTRUCTIONS,
     _build_semi_static_block,
+    _cache_invalidate,
 )
 from agent.prompts.iframe_builder import IFRAME_BUILDER_CONTEXT
 from agent.prompts.builder import (
@@ -197,7 +198,7 @@ async def agent_endpoint(req: AgentRequest, request: Request):
     # Resolve tier and enforce rate/quota limits before streaming
     tier = await get_user_tier(supabase, req.user_id)
 
-    rate_allowed, retry_after = check_rate_limit(req.user_id, tier)
+    rate_allowed, retry_after = await check_rate_limit(req.user_id, tier)
     if not rate_allowed:
         return JSONResponse(
             status_code=429,
@@ -212,7 +213,14 @@ async def agent_endpoint(req: AgentRequest, request: Request):
             content={"error": "quota_exhausted", "remaining": 0, "resets_at": quota["resets_at"]},
         )
 
-    queue: asyncio.Queue = asyncio.Queue()
+    slot_acquired = await acquire_turn_slot(req.user_id, tier)
+    if not slot_acquired:
+        return JSONResponse(
+            status_code=429,
+            content={"error": "concurrent_limit"},
+        )
+
+    queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
 
     async def on_event(event: dict):
         await queue.put(event)
@@ -268,6 +276,7 @@ async def agent_endpoint(req: AgentRequest, request: Request):
                                 yield format_sse_event({"type": "done"})
                         break
         finally:
+            await release_turn_slot(req.user_id)
             if not task.done():
                 task.cancel()
                 try:
@@ -288,6 +297,9 @@ async def admin_domus_context(space_id: str, user_id: str, request: Request):
     """Snapshot the Domus agent's assembled context — blocks, entity index, health."""
     supabase = request.app.state.supabase
     now_utc = datetime.now(timezone.utc)
+
+    # Always show live Supabase state — bypass the entity index cache.
+    await _cache_invalidate(f"entity_index:{space_id}")
 
     async def _count_type(type_: str) -> list:
         result = await (
@@ -368,11 +380,22 @@ async def admin_domus_context(space_id: str, user_id: str, request: Request):
     edge_count = len(edge_rows)
     compaction_needed = active_turn_count > cfg.COMPACTION_TURN_THRESHOLD
 
+    total_chars = static_chars + semi_static_chars
     return JSONResponse({
         "agent": "domus",
         "space_id": space_id,
         "user_id": user_id,
         "assembled_at": now_utc.isoformat(),
+        "prompt_structure": {
+            "total_chars": total_chars,
+            "token_estimate": total_chars // 4,
+            "model": cfg.AGENT_MODEL,
+            "blocks": {
+                "static":      {"chars": static_chars,      "token_estimate": static_chars // 4,      "cached": True},
+                "semi_static": {"chars": semi_static_chars, "token_estimate": semi_static_chars // 4, "cached": True},
+                "dynamic":     {"chars": 0,                 "token_estimate": 0,                      "cached": False},
+            },
+        },
         "blocks": {
             "static": {
                 "chars": static_chars,
@@ -444,16 +467,17 @@ async def admin_domus_context(space_id: str, user_id: str, request: Request):
 
 
 @app.get("/admin/builder-context", dependencies=[Depends(verify_service_auth)])
-async def admin_builder_context(space_id: str, request: Request):
+async def admin_builder_context(space_id: str, user_id: str, request: Request):
     """Snapshot the Builder agent's prompt structure and recent declarative/iframe apps."""
     supabase = request.app.state.supabase
     now_utc = datetime.now(timezone.utc)
 
-    # Query all app entities for this space
+    # Query app entities for this user's space
     result = await (
         supabase.table("entities")
         .select("id, state, summary, updated_at, created_at")
         .eq("space_id", space_id)
+        .eq("user_id", user_id)
         .eq("type", "app")
         .eq("archived", False)
         .order("updated_at", desc=True)
@@ -510,6 +534,7 @@ async def admin_builder_context(space_id: str, request: Request):
     return JSONResponse({
         "agent": "builder",
         "space_id": space_id,
+        "user_id": user_id,
         "assembled_at": now_utc.isoformat(),
         "prompt_structure": {
             "total_chars": total_chars,

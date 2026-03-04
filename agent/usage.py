@@ -38,10 +38,17 @@ class Tier(str, Enum):
 # In-process caches
 # ---------------------------------------------------------------------------
 
+# Note: _tier_cache is not lock-protected. Two concurrent misses for the same user_id
+# will both query the DB and write the same value — this is an intentional TOCTOU
+# trade-off (idempotent, benign) to avoid serializing all tier lookups under a lock.
 _tier_cache: dict[str, tuple[float, "Tier"]] = {}  # user_id -> (stored_at, tier)
 _TIER_CACHE_TTL = 300.0  # 5 minutes
 
 _rate_windows: dict[str, list[float]] = {}  # user_id -> list of request timestamps
+_rate_windows_lock = asyncio.Lock()
+
+_active_turns: dict[str, int] = {}  # user_id -> active turn count
+_active_turns_lock = asyncio.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -136,7 +143,7 @@ async def check_quota(client, user_id: str, tier: "Tier", event_type: str) -> di
 # ---------------------------------------------------------------------------
 
 
-def check_rate_limit(user_id: str, tier: "Tier") -> tuple[bool, int]:
+async def check_rate_limit(user_id: str, tier: "Tier") -> tuple[bool, int]:
     """Check and record a request in the sliding-window rate limiter.
 
     Prunes timestamps older than 60s, then checks against
@@ -152,19 +159,47 @@ def check_rate_limit(user_id: str, tier: "Tier") -> tuple[bool, int]:
     now = time.monotonic()
     rpm = cfg.RATE_LIMITS[tier.value]["requests_per_minute"]
 
-    window = _rate_windows.get(user_id, [])
-    # Prune timestamps outside the 60-second window
-    window = [t for t in window if now - t < 60.0]
+    async with _rate_windows_lock:
+        window = _rate_windows.get(user_id, [])
+        # Prune timestamps outside the 60-second window
+        window = [t for t in window if now - t < 60.0]
 
-    if len(window) >= rpm:
-        oldest = window[0]
-        retry_after = max(1, int(60.0 - (now - oldest)) + 1)
+        if len(window) >= rpm:
+            oldest = window[0]
+            retry_after = max(1, int(60.0 - (now - oldest)) + 1)
+            _rate_windows[user_id] = window
+            return False, retry_after
+
+        window.append(now)
         _rate_windows[user_id] = window
-        return False, retry_after
+        return True, 0
 
-    window.append(now)
-    _rate_windows[user_id] = window
-    return True, 0
+
+# ---------------------------------------------------------------------------
+# Concurrent turn slot management
+# ---------------------------------------------------------------------------
+
+
+async def acquire_turn_slot(user_id: str, tier: "Tier") -> bool:
+    """Acquire a concurrent turn slot for a user.
+
+    Returns True if slot was acquired, False if at the limit.
+    """
+    limit = cfg.RATE_LIMITS[tier.value]["concurrent_turns"]
+    async with _active_turns_lock:
+        current = _active_turns.get(user_id, 0)
+        if current >= limit:
+            return False
+        _active_turns[user_id] = current + 1
+        return True
+
+
+async def release_turn_slot(user_id: str) -> None:
+    """Release a concurrent turn slot. Safe to call even if no slot held."""
+    async with _active_turns_lock:
+        current = _active_turns.get(user_id, 0)
+        if current > 0:
+            _active_turns[user_id] = current - 1
 
 
 # ---------------------------------------------------------------------------

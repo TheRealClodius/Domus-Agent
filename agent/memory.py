@@ -32,6 +32,12 @@ Schema:
       "source_turn_ids": ["turn_id", ...]
     }
   ],
+  "personality_traits": [
+    {
+      "content": "string — an inferred personality trait or communication style preference",
+      "confidence": 0.0-1.0
+    }
+  ],
   "edges": [
     {
       "source_id": "entity_id",
@@ -40,7 +46,8 @@ Schema:
       "weight": 1.0
     }
   ],
-  "duplicate_fact_ids": ["existing_fact_entity_id", ...]
+  "duplicate_fact_ids": ["existing_fact_entity_id", ...],
+  "duplicate_trait_ids": ["existing_personality_trait_entity_id", ...]
 }
 
 Rules:
@@ -50,6 +57,7 @@ Rules:
 - NEVER store email addresses, phone numbers, or URLs as facts — not the user's own, and especially not anyone else's.
 - NEVER infer or record identity links for third parties (e.g. "Person X's email is Y", "Contact Z works at company W"). You may note that the user collaborates with or knows someone by first name, but do not attach contact details or account information to them.
 - Facts about the user's own life, preferences, habits, schedule, interests, and communication style are fine.
+- personality_traits capture inferred traits: communication style, working patterns, preferences, personality characteristics. Only include genuinely new traits. If a trait is already captured by an existing personality_trait entity (listed below), include its ID in duplicate_trait_ids instead.
 """
 
 
@@ -130,16 +138,23 @@ async def compact_conversation(
     # Keep 5 most recent; archive the rest
     archival_turns = all_turns[:-5]
 
-    # Step 3: Fetch existing facts for deduplication
-    facts_result = await (
+    # Step 3: Fetch existing facts and traits for deduplication
+    facts_result, traits_result = await asyncio.gather(
         client.table("entities")
         .select("id, state")
         .eq("space_id", space_id)
         .eq("type", "fact")
         .eq("archived", False)
-        .execute()
+        .execute(),
+        client.table("entities")
+        .select("id, state")
+        .eq("space_id", space_id)
+        .eq("type", "personality_trait")
+        .eq("archived", False)
+        .execute(),
     )
     existing_facts = facts_result.data or []
+    existing_traits = traits_result.data or []
 
     # Step 4: Build prompt and call Opus
     formatted_turns = [
@@ -155,12 +170,19 @@ async def compact_conversation(
         for f in existing_facts
     ) or "(none)"
 
+    existing_traits_text = "\n".join(
+        f"- [{t['id']}] {t.get('state', {}).get('content', '')}"
+        for t in existing_traits
+    ) or "(none)"
+
     user_prompt = (
         f"Existing facts in this space:\n"
         f"<existing_facts>\n{existing_facts_text}\n</existing_facts>\n\n"
+        f"Existing personality traits in this space:\n"
+        f"<existing_traits>\n{existing_traits_text}\n</existing_traits>\n\n"
         f"Conversation to compact:\n"
         f"<turns>\n{json.dumps(formatted_turns, indent=2)}\n</turns>\n\n"
-        f"Return JSON with keys: summary, facts, edges, duplicate_fact_ids."
+        f"Return JSON with keys: summary, facts, personality_traits, edges, duplicate_fact_ids, duplicate_trait_ids."
     )
 
     response = await anthropic_client.messages.create(
@@ -174,13 +196,18 @@ async def compact_conversation(
     if hasattr(response, "usage"):
         u = response.usage
         from agent.usage import record_usage
-        asyncio.create_task(
+        from agent.loop import _bg
+        _bg(
             record_usage(client, space_id, user_id, "compaction", {
                 "input_tokens": getattr(u, "input_tokens", 0),
                 "output_tokens": getattr(u, "output_tokens", 0),
                 "turns_compacted": len(archival_turns),
             })
         )
+
+    if not response.content or not hasattr(response.content[0], "text"):
+        logger.error("compaction_unexpected_response", extra={"space_id": space_id})
+        return {"compacted": False, "error": "unexpected_response"}
 
     raw = response.content[0].text.strip()
     if raw.startswith("```"):
@@ -210,64 +237,74 @@ async def compact_conversation(
     summary_result = await client.table("entities").insert(summary_row).execute()
     summary_id = summary_result.data[0]["id"] if summary_result.data else None
 
-    # Step 6: Create fact entities (model already filtered duplicates)
-    facts_created = 0
-    for fact in parsed.get("facts", []):
+    # Steps 6-8: Create fact, personality_trait, and edge entities in parallel.
+    # Inner helpers are closures capturing space_id, user_id, client.
+
+    async def _insert_fact(fact: dict) -> bool:
         content = fact.get("content", "").strip()
         if not content:
-            continue
+            return False
         if _contains_pii(content):
             logger.warning("fact_pii_blocked", extra={"content": content[:80]})
-            continue
-        fact_row = {
-            "space_id": space_id,
-            "user_id": user_id,
-            "type": "fact",
+            return False
+        row = {
+            "space_id": space_id, "user_id": user_id, "type": "fact",
             "presentation": "hidden",
-            "state": {
-                "content": content,
-                "confidence": fact.get("confidence", 1.0),
-            },
-            "summary": content[:100],
-            "created_by": "agent",
+            "state": {"content": content, "confidence": fact.get("confidence", 1.0)},
+            "summary": content[:100], "created_by": "agent",
         }
-        await client.table("entities").insert(fact_row).execute()
-        facts_created += 1
+        await client.table("entities").insert(row).execute()
+        return True
 
-    # Step 7: Create edge entities
-    edges_created = 0
-    for edge in parsed.get("edges", []):
+    async def _insert_trait(trait: dict) -> bool:
+        content = trait.get("content", "").strip()
+        if not content:
+            return False
+        row = {
+            "space_id": space_id, "user_id": user_id, "type": "personality_trait",
+            "presentation": "hidden",
+            "state": {"content": content, "confidence": trait.get("confidence", 1.0)},
+            "summary": content[:100], "created_by": "agent",
+        }
+        await client.table("entities").insert(row).execute()
+        return True
+
+    async def _insert_edge(edge: dict) -> bool:
         source_id = edge.get("source_id", "")
         target_id = edge.get("target_id", "")
         if not source_id or not target_id:
-            continue
-        edge_row = {
-            "space_id": space_id,
-            "user_id": user_id,
-            "type": "edge",
+            return False
+        row = {
+            "space_id": space_id, "user_id": user_id, "type": "edge",
             "presentation": "hidden",
             "state": {
-                "source_id": source_id,
-                "target_id": target_id,
-                "relation": edge.get("relation", ""),
-                "weight": edge.get("weight", 1.0),
+                "source_id": source_id, "target_id": target_id,
+                "relation": edge.get("relation", ""), "weight": edge.get("weight", 1.0),
             },
             "summary": f"{source_id} → {target_id} ({edge.get('relation', '')})",
             "created_by": "agent",
         }
-        await client.table("entities").insert(edge_row).execute()
-        edges_created += 1
+        await client.table("entities").insert(row).execute()
+        return True
 
-    # Step 8: Archive old turns
-    turns_archived = 0
-    for turn in archival_turns:
-        await (
-            client.table("entities")
-            .update({"archived": True})
-            .eq("id", turn["id"])
-            .execute()
-        )
-        turns_archived += 1
+    fact_results, trait_results, edge_results = await asyncio.gather(
+        asyncio.gather(*[_insert_fact(f) for f in parsed.get("facts", [])]),
+        asyncio.gather(*[_insert_trait(t) for t in parsed.get("personality_traits", [])]),
+        asyncio.gather(*[_insert_edge(e) for e in parsed.get("edges", [])]),
+    )
+    facts_created = sum(1 for r in fact_results if r)
+    traits_created = sum(1 for r in trait_results if r)
+    edges_created = sum(1 for r in edge_results if r)
+
+    # Step 9: Archive old turns in a single batch update
+    ids_to_archive = [t["id"] for t in archival_turns]
+    await (
+        client.table("entities")
+        .update({"archived": True})
+        .in_("id", ids_to_archive)
+        .execute()
+    )
+    turns_archived = len(ids_to_archive)
 
     logger.info(
         "compaction_complete",
@@ -275,9 +312,11 @@ async def compact_conversation(
             "space_id": space_id,
             "summary_id": summary_id,
             "facts_created": facts_created,
+            "traits_created": traits_created,
             "edges_created": edges_created,
             "turns_archived": turns_archived,
             "duplicate_fact_ids": parsed.get("duplicate_fact_ids", []),
+            "duplicate_trait_ids": parsed.get("duplicate_trait_ids", []),
         },
     )
 
@@ -285,6 +324,7 @@ async def compact_conversation(
         "compacted": True,
         "summary_id": summary_id,
         "fact_count": facts_created,
+        "trait_count": traits_created,
         "edge_count": edges_created,
         "turns_archived": turns_archived,
     }

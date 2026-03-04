@@ -244,6 +244,14 @@ class TestAdminDomusContext:
         assert blocks["dynamic"]["cached"] is False
         assert blocks["dynamic"]["session_window_minutes"] == 90
 
+        ps = data["prompt_structure"]
+        assert ps["total_chars"] > 0
+        assert ps["token_estimate"] == ps["total_chars"] // 4
+        assert "model" in ps
+        assert ps["blocks"]["static"]["cached"] is True
+        assert ps["blocks"]["semi_static"]["cached"] is True
+        assert ps["blocks"]["dynamic"]["cached"] is False
+
         health = data["health"]
         assert "active_turn_count" in health
         assert "compaction_threshold" in health
@@ -262,7 +270,9 @@ class TestAdminBuilderContext:
     """GET /admin/builder-context returns a Builder agent prompt + app snapshot."""
 
     async def test_requires_auth(self, client):
-        resp = await client.get(f"/admin/builder-context?space_id={TEST_SPACE_ID}")
+        resp = await client.get(
+            f"/admin/builder-context?space_id={TEST_SPACE_ID}&user_id={TEST_USER_ID}"
+        )
         assert resp.status_code == 401
 
     async def test_returns_prompt_structure(self, app, client):
@@ -271,7 +281,7 @@ class TestAdminBuilderContext:
         app.state.supabase.set_table_response("entities", [])
 
         resp = await client.get(
-            f"/admin/builder-context?space_id={TEST_SPACE_ID}",
+            f"/admin/builder-context?space_id={TEST_SPACE_ID}&user_id={TEST_USER_ID}",
             headers={"Authorization": "Bearer test-token"},
         )
 
@@ -279,6 +289,7 @@ class TestAdminBuilderContext:
         data = resp.json()
         assert data["agent"] == "builder"
         assert data["space_id"] == TEST_SPACE_ID
+        assert data["user_id"] == TEST_USER_ID
         assert "assembled_at" in data
 
         ps = data["prompt_structure"]
@@ -313,7 +324,7 @@ class TestAdminBuilderContext:
         app.state.supabase.set_table_response("entities", [app_entity])
 
         resp = await client.get(
-            f"/admin/builder-context?space_id={TEST_SPACE_ID}",
+            f"/admin/builder-context?space_id={TEST_SPACE_ID}&user_id={TEST_USER_ID}",
             headers={"Authorization": "Bearer test-token"},
         )
 
@@ -343,7 +354,7 @@ class TestAdminBuilderContext:
         app.state.supabase.set_table_response("entities", [app_entity])
 
         resp = await client.get(
-            f"/admin/builder-context?space_id={TEST_SPACE_ID}",
+            f"/admin/builder-context?space_id={TEST_SPACE_ID}&user_id={TEST_USER_ID}",
             headers={"Authorization": "Bearer test-token"},
         )
 
@@ -354,3 +365,39 @@ class TestAdminBuilderContext:
         ia = data["iframe_apps"][0]
         assert ia["entity_id"] == "app-456"
         assert ia["name"] == "Calc"
+
+
+# ---------------------------------------------------------------------------
+# TestConcurrentTurnLimit
+# ---------------------------------------------------------------------------
+
+
+class TestConcurrentTurnLimit:
+    """POST /agent returns 429 when a user's concurrent turn slot is exhausted."""
+
+    async def test_concurrent_limit_returns_429(self, app, client):
+        """Pre-acquiring all FREE tier slots forces the next request to 429."""
+        import uuid as _uuid
+        from agent.usage import acquire_turn_slot, release_turn_slot, Tier
+
+        # Use a fresh user_id to avoid state pollution from other tests
+        user_id = str(_uuid.uuid4())
+
+        # FREE tier allows 1 concurrent turn — acquire it
+        await acquire_turn_slot(user_id, Tier.FREE)
+
+        try:
+            resp = await client.post(
+                "/agent",
+                json={
+                    "space_id": TEST_SPACE_ID,
+                    "message": "Hello",
+                    "user_id": user_id,
+                },
+                headers={"Authorization": "Bearer test-token"},
+            )
+            assert resp.status_code == 429
+            data = resp.json()
+            assert data["error"] == "concurrent_limit"
+        finally:
+            await release_turn_slot(user_id)

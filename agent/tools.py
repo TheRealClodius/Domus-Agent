@@ -11,6 +11,7 @@ import asyncio
 import time
 
 from agent.logging import get_logger
+from agent.context import _cache_invalidate
 
 logger = get_logger("agent.tools")
 
@@ -55,6 +56,7 @@ TOOL_DEFINITIONS = [
                     "type": "object",
                     "description": (
                         "Structured data for renderers. "
+                        "For image entities, include {\"generation_prompt\": \"<description>\"}. "
                         "Use only when a component needs typed fields."
                     ),
                 },
@@ -328,19 +330,30 @@ TOOL_DEFINITIONS[-1]["cache_control"] = {"type": "ephemeral"}
 # Tool implementations
 # ---------------------------------------------------------------------------
 
+_INTERNAL_TYPES = {
+    "conversation_turn",
+    "conversation_summary",
+    "fact",
+    "personality_trait",
+    "edge",
+}
+
 
 async def create_entity(client, space_id: str, user_id: str, params: dict) -> dict:
-    """Insert a new entity. Always sets created_by='agent'.
+    """Create a new entity. Internal types insert directly to Supabase (presentation=hidden).
+    User-facing types POST to the Next.js API. Always sets created_by='agent'.
 
     For image entities with state.generation_prompt, automatically generates
-    the image via Gemini and enriches the state with image_url, width, height.
+    the image via Gemini and enriches the state with image_url, width, height
+    before forwarding to the frontend.
     """
-    entity_type = params["type"]
-    state = dict(params.get("state", {}))
+    entity_type = params.get("type", "note")
+    state = dict(params.get("state") or {})
 
-    # Image generation: type='image' + generation_prompt triggers Gemini pipeline
-    is_image_gen = entity_type == "image" and "generation_prompt" in state
-    if is_image_gen:
+    # Image generation: type='image' + generation_prompt (or prompt) triggers Gemini pipeline
+    if "prompt" in state and "generation_prompt" not in state:
+        state["generation_prompt"] = state.pop("prompt")
+    if entity_type == "image" and "generation_prompt" in state:
         from agent.image_gen import generate_image
 
         try:
@@ -357,42 +370,50 @@ async def create_entity(client, space_id: str, user_id: str, params: dict) -> di
             )
             state["generation_error"] = str(e)[:200]
 
-    # Image-specific defaults
-    if entity_type == "image":
-        default_presentation = "card"
-        default_size = {"width": 232, "height": 300}
-    else:
-        default_presentation = "window"
-        default_size = {"width": 600, "height": 400}
-
-    row = {
-        "space_id": space_id,
-        "user_id": user_id,
-        "type": entity_type,
-        "content": params.get("content") or "",
-        "presentation": params.get("presentation", default_presentation),
-        "position": params.get("position", {"x": 50, "y": 50, "locked": False}),
-        "size": params.get("size", default_size),
-        "state": state,
-        "summary": params.get("summary"),
-        "created_by": "agent",
-    }
-    try:
+    if entity_type in _INTERNAL_TYPES:
+        row: dict = {
+            "space_id": space_id,
+            "user_id": user_id,
+            "type": entity_type,
+            "presentation": "hidden",
+            "state": state,
+            "created_by": "agent",
+        }
+        for field in ("content", "summary"):
+            if field in params:
+                row[field] = params[field]
         result = await client.table("entities").insert(row).execute()
-    except Exception as e:
-        logger.error(
-            "create_entity_insert_failed",
-            extra={
-                "space_id": space_id,
-                "entity_type": entity_type,
-                "error": str(e)[:500],
-                "row_keys": list(row.keys()),
-                "presentation": row.get("presentation"),
-                "state_keys": list(state.keys()) if isinstance(state, dict) else str(type(state)),
-            },
-        )
-        raise
-    return result.data[0] if result.data else row
+        await _cache_invalidate(f"entity_index:{space_id}")
+        return result.data[0] if result.data else row
+
+    import httpx
+    from config import DOMUS_FRONTEND_URL, DOMUS_SERVICE_TOKEN
+
+    body: dict = {"created_by": "agent", "type": entity_type}
+    for field in ("content", "summary", "position", "size"):
+        if field in params:
+            body[field] = params[field]
+    if state:
+        body["state"] = state
+
+    try:
+        async with httpx.AsyncClient() as http:
+            resp = await http.post(
+                f"{DOMUS_FRONTEND_URL}/api/entities",
+                params={"space_id": space_id},
+                headers={"Authorization": f"Bearer {DOMUS_SERVICE_TOKEN}"},
+                json=body,
+                timeout=10.0,
+            )
+    except httpx.TimeoutException:
+        return {"error": "frontend_timeout", "tool": "create_entity"}
+    except httpx.ConnectError:
+        return {"error": "frontend_unreachable", "tool": "create_entity"}
+
+    if resp.status_code not in (200, 201):
+        return {"error": "create_failed", "status": resp.status_code, "body": resp.text}
+    await _cache_invalidate(f"entity_index:{space_id}")
+    return resp.json()
 
 
 async def read_entity(client, space_id: str, user_id: str, params: dict) -> dict:
@@ -445,64 +466,36 @@ async def query_entities(client, space_id: str, user_id: str, params: dict) -> d
 
 
 async def update_entity(client, space_id: str, user_id: str, params: dict) -> dict:
-    """Update entity using RFC 7396 merge patch for state."""
+    """PATCH an entity via the Next.js API. RFC 7396 merge patch is handled by the frontend."""
+    import httpx
+    from config import DOMUS_FRONTEND_URL, DOMUS_SERVICE_TOKEN
+
     entity_id = params["id"]
-
-    # Read current entity
-    current = (
-        await client.table("entities")
-        .select("*")
-        .eq("id", entity_id)
-        .eq("space_id", space_id)
-        .maybe_single()
-        .execute()
-    )
-    if not current.data:
-        return {"error": "not_found", "id": entity_id}
-
-    current_data = current.data
-
-    # Build update dict
-    updates = {}
-
-    if "state" in params:
-        # RFC 7396 merge patch
-        merged = _merge_patch(current_data.get("state", {}), params["state"])
-        updates["state"] = merged
-
-    for field in ("content", "summary", "position", "size", "presentation"):
+    body: dict = {}
+    for field in ("content", "state", "summary", "position", "size", "presentation", "archived"):
         if field in params:
-            updates[field] = params[field]
+            body[field] = params[field]
 
-    if not updates:
-        return current_data
+    try:
+        async with httpx.AsyncClient() as http:
+            resp = await http.patch(
+                f"{DOMUS_FRONTEND_URL}/api/entities/{entity_id}",
+                params={"space_id": space_id},
+                headers={"Authorization": f"Bearer {DOMUS_SERVICE_TOKEN}"},
+                json=body,
+                timeout=10.0,
+            )
+    except httpx.TimeoutException:
+        return {"error": "frontend_timeout", "tool": "update_entity"}
+    except httpx.ConnectError:
+        return {"error": "frontend_unreachable", "tool": "update_entity"}
 
-    result = await (
-        client.table("entities")
-        .update(updates)
-        .eq("id", entity_id)
-        .eq("space_id", space_id)
-        .execute()
-    )
-    if isinstance(result.data, list) and result.data:
-        return result.data[0]
-    # Construct the merged row from current data + updates
-    return {**current_data, **updates}
-
-
-def _merge_patch(target: dict, patch: dict) -> dict:
-    """RFC 7396 JSON Merge Patch — pure Python implementation."""
-    if not isinstance(patch, dict):
-        return patch
-    result = dict(target)
-    for key, value in patch.items():
-        if value is None:
-            result.pop(key, None)
-        elif isinstance(value, dict) and isinstance(result.get(key), dict):
-            result[key] = _merge_patch(result[key], value)
-        else:
-            result[key] = value
-    return result
+    if resp.status_code == 409:
+        return resp.json()  # {"error": "folder_has_children", "child_ids": [...], "count": N}
+    if resp.status_code != 200:
+        return {"error": "update_failed", "status": resp.status_code, "body": resp.text}
+    await _cache_invalidate(f"entity_index:{space_id}")
+    return resp.json()
 
 
 # ---------------------------------------------------------------------------
@@ -518,13 +511,18 @@ async def get_entity_schema(client, space_id: str, user_id: str, params: dict) -
     entity_id = params["entity_id"]
     url = f"{DOMUS_FRONTEND_URL}/api/entities/{entity_id}/schema"
 
-    async with httpx.AsyncClient() as http:
-        resp = await http.get(
-            url,
-            params={"space_id": space_id},
-            headers={"Authorization": f"Bearer {DOMUS_SERVICE_TOKEN}"},
-            timeout=10.0,
-        )
+    try:
+        async with httpx.AsyncClient() as http:
+            resp = await http.get(
+                url,
+                params={"space_id": space_id},
+                headers={"Authorization": f"Bearer {DOMUS_SERVICE_TOKEN}"},
+                timeout=10.0,
+            )
+    except httpx.TimeoutException:
+        return {"error": "frontend_timeout", "tool": "get_entity_schema"}
+    except httpx.ConnectError:
+        return {"error": "frontend_unreachable", "tool": "get_entity_schema"}
 
     if resp.status_code != 200:
         return {"error": "schema_fetch_failed", "status": resp.status_code, "body": resp.text}
@@ -541,17 +539,23 @@ async def call_entity_tool(client, space_id: str, user_id: str, params: dict) ->
     tool_params = params.get("params", {})
     url = f"{DOMUS_FRONTEND_URL}/api/entities/{entity_id}/call"
 
-    async with httpx.AsyncClient() as http:
-        resp = await http.post(
-            url,
-            params={"space_id": space_id},
-            headers={"Authorization": f"Bearer {DOMUS_SERVICE_TOKEN}"},
-            json={"tool_name": tool_name, "params": tool_params},
-            timeout=10.0,
-        )
+    try:
+        async with httpx.AsyncClient() as http:
+            resp = await http.post(
+                url,
+                params={"space_id": space_id},
+                headers={"Authorization": f"Bearer {DOMUS_SERVICE_TOKEN}"},
+                json={"tool_name": tool_name, "params": tool_params},
+                timeout=10.0,
+            )
+    except httpx.TimeoutException:
+        return {"error": "frontend_timeout", "tool": "call_entity_tool"}
+    except httpx.ConnectError:
+        return {"error": "frontend_unreachable", "tool": "call_entity_tool"}
 
     if resp.status_code != 200:
         return {"error": "tool_call_failed", "status": resp.status_code, "body": resp.text}
+    await _cache_invalidate(f"entity_index:{space_id}")
     return resp.json()
 
 
@@ -628,6 +632,7 @@ async def build_app(client, space_id: str, user_id: str, params: dict) -> dict:
 
     result = await client.table("entities").insert(row).execute()
     entity = result.data[0] if result.data else row
+    await _cache_invalidate(f"entity_index:{space_id}")
     return {"ok": True, "entity_id": entity.get("id", ""), "name": params["name"]}
 
 
@@ -665,6 +670,7 @@ async def update_app(client, space_id: str, user_id: str, params: dict) -> dict:
         .execute()
     )
 
+    await _cache_invalidate(f"entity_index:{space_id}")
     return {"ok": True, "entity_id": entity_id}
 
 
@@ -697,8 +703,11 @@ async def web_search(client, space_id: str, user_id: str, params: dict) -> dict:
         return {"error": "web_search_failed", "status": resp.status_code}
 
     data = resp.json()
-    answer = data["choices"][0]["message"]["content"]
-    citations = [{"url": url} for url in data.get("citations", [])]
+    choices = data.get("choices") or []
+    if not choices:
+        return {"error": "web_search_failed", "message": "Unexpected response from Perplexity"}
+    answer = choices[0].get("message", {}).get("content", "")
+    citations = [{"url": url} for url in (data.get("citations") or []) if isinstance(url, str)]
     return {"answer": answer, "citations": citations}
 
 
@@ -738,7 +747,7 @@ async def execute_tool(
     if tier is not None:
         if name == "create_entity":
             state = params.get("state", {}) or {}
-            if params.get("type") == "image" and "generation_prompt" in state:
+            if params.get("type") == "image" and ("generation_prompt" in state or "prompt" in state):
                 quota = await check_quota(client, user_id, tier, "image_generation")
                 if not quota["allowed"]:
                     return {
@@ -762,7 +771,8 @@ async def execute_tool(
         result = {"error": "tool_execution_failed", "tool": name, "message": str(e)}
 
     ms = round((time.monotonic() - t0) * 1000)
-    asyncio.create_task(
+    from agent.loop import _bg
+    _bg(
         record_usage(client, space_id, user_id, "tool_call", {
             "tool_name": name,
             "duration_ms": ms,

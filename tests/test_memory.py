@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from agent.memory import compact_conversation
+from agent.memory import compact_conversation, trim_conversation_free
 from agent.context import get_conversation_summaries
 from tests.conftest import TEST_SPACE_ID, TEST_USER_ID
 
@@ -40,6 +40,15 @@ def _make_fact(content: str = "User likes coffee", confidence: float = 0.9) -> d
     }
 
 
+def _make_trait(content: str = "Prefers bullet points", confidence: float = 0.8) -> dict:
+    return {
+        "id": str(uuid.uuid4()),
+        "space_id": TEST_SPACE_ID,
+        "type": "personality_trait",
+        "state": {"content": content, "confidence": confidence},
+    }
+
+
 def _make_summary(summary: str, created_at: str | None = None) -> dict:
     now = created_at or datetime.now(timezone.utc).isoformat()
     return {
@@ -60,6 +69,7 @@ class _TrackingQueryBuilder:
         self._op = "select"
         self._type_filter: str | None = None
         self._id_filter: str | None = None
+        self._in_filter: list | None = None
         self._insert_data: dict | None = None
         self._update_data: dict | None = None
 
@@ -83,6 +93,11 @@ class _TrackingQueryBuilder:
             self._id_filter = val
         return self
 
+    def in_(self, col, values):
+        if col == "id":
+            self._in_filter = values
+        return self
+
     def neq(self, *a, **kw):
         return self
 
@@ -99,6 +114,8 @@ class _TrackingQueryBuilder:
                 result.data = self._client._turns
             elif self._type_filter == "fact":
                 result.data = self._client._facts
+            elif self._type_filter == "personality_trait":
+                result.data = self._client._traits
             elif self._type_filter == "conversation_summary":
                 result.data = self._client._summaries
             else:
@@ -108,10 +125,13 @@ class _TrackingQueryBuilder:
             entity_id = str(uuid.uuid4())
             result.data = [{**self._insert_data, "id": entity_id}]
         elif self._op == "update":
-            self._client._updates.append(
-                {"id": self._id_filter, "data": self._update_data}
-            )
-            result.data = [{"id": self._id_filter}]
+            entry: dict = {"data": self._update_data}
+            if self._id_filter is not None:
+                entry["id"] = self._id_filter
+            if self._in_filter is not None:
+                entry["in_ids"] = self._in_filter
+            self._client._updates.append(entry)
+            result.data = [{"id": self._id_filter or "batch"}]
         return result
 
 
@@ -121,6 +141,7 @@ class TrackingClient:
     def __init__(self):
         self._turns: list[dict] = []
         self._facts: list[dict] = []
+        self._traits: list[dict] = []
         self._summaries: list[dict] = []
         self._inserts: list[dict] = []
         self._updates: list[dict] = []
@@ -130,6 +151,9 @@ class TrackingClient:
 
     def set_facts(self, facts: list[dict]):
         self._facts = facts
+
+    def set_traits(self, traits: list[dict]):
+        self._traits = traits
 
     def set_summaries(self, summaries: list[dict]):
         self._summaries = summaries
@@ -151,6 +175,8 @@ def _make_opus_mock(
     facts: list[dict] | None = None,
     edges: list[dict] | None = None,
     duplicate_fact_ids: list[str] | None = None,
+    personality_traits: list[dict] | None = None,
+    duplicate_trait_ids: list[str] | None = None,
 ) -> AsyncMock:
     """Build a mock Anthropic client that returns structured JSON compaction response."""
     payload = {
@@ -158,6 +184,8 @@ def _make_opus_mock(
         "facts": facts or [],
         "edges": edges or [],
         "duplicate_fact_ids": duplicate_fact_ids or [],
+        "personality_traits": personality_traits or [],
+        "duplicate_trait_ids": duplicate_trait_ids or [],
     }
     content_block = MagicMock()
     content_block.text = json.dumps(payload)
@@ -282,7 +310,7 @@ class TestCompactConversation:
         assert fact_inserts[0]["state"]["content"] == "User is a developer"
 
     async def test_archives_old_turns_preserves_recent_5(self):
-        """Archives all but the 5 most recent turns."""
+        """Archives all but the 5 most recent turns in a single batch update."""
         client = TrackingClient()
         client.set_turns([_make_turn(i) for i in range(45)])
 
@@ -294,10 +322,12 @@ class TestCompactConversation:
         # 45 total - 5 preserved = 40 archived
         assert result["turns_archived"] == 40
 
+        # Batch archiving: exactly 1 update with 40 IDs
         archive_updates = [
             u for u in client._updates if u.get("data", {}).get("archived") is True
         ]
-        assert len(archive_updates) == 40
+        assert len(archive_updates) == 1
+        assert len(archive_updates[0].get("in_ids", [])) == 40
 
     async def test_creates_edge_entities(self):
         """Creates edge entities for relationships returned by Opus."""
@@ -365,6 +395,75 @@ class TestCompactConversation:
 
         call_kwargs = mock_anthropic.messages.create.call_args
         assert call_kwargs[1]["model"] == cfg.COMPACTION_MODEL
+
+    async def test_creates_personality_trait_entities(self):
+        """Creates a personality_trait entity for each trait returned by Opus."""
+        client = TrackingClient()
+        client.set_turns([_make_turn(i) for i in range(45)])
+
+        traits = [
+            {"content": "Prefers concise responses", "confidence": 0.85},
+            {"content": "Works in short focused sessions", "confidence": 0.7},
+        ]
+        mock_anthropic = _make_opus_mock(personality_traits=traits)
+        result = await compact_conversation(
+            client, mock_anthropic, TEST_SPACE_ID, TEST_USER_ID
+        )
+
+        assert result["trait_count"] == 2
+        trait_inserts = client.inserts_by_type.get("personality_trait", [])
+        assert len(trait_inserts) == 2
+        contents = {t["state"]["content"] for t in trait_inserts}
+        assert contents == {"Prefers concise responses", "Works in short focused sessions"}
+
+    async def test_personality_traits_are_hidden(self):
+        """personality_trait entities must have presentation='hidden'."""
+        client = TrackingClient()
+        client.set_turns([_make_turn(i) for i in range(45)])
+
+        traits = [{"content": "Detail-oriented", "confidence": 0.8}]
+        mock_anthropic = _make_opus_mock(personality_traits=traits)
+        await compact_conversation(client, mock_anthropic, TEST_SPACE_ID, TEST_USER_ID)
+
+        trait_inserts = client.inserts_by_type.get("personality_trait", [])
+        assert len(trait_inserts) == 1
+        assert trait_inserts[0]["presentation"] == "hidden"
+        assert trait_inserts[0]["state"]["confidence"] == 0.8
+
+    async def test_duplicate_traits_not_re_created(self):
+        """When model reports duplicate_trait_ids, existing traits are not re-created."""
+        existing_trait_id = str(uuid.uuid4())
+        client = TrackingClient()
+        client.set_turns([_make_turn(i) for i in range(45)])
+        client.set_traits([_make_trait("Prefers bullet points")])
+
+        traits = [{"content": "Likes dark mode", "confidence": 0.75}]
+        mock_anthropic = _make_opus_mock(
+            personality_traits=traits, duplicate_trait_ids=[existing_trait_id]
+        )
+        result = await compact_conversation(
+            client, mock_anthropic, TEST_SPACE_ID, TEST_USER_ID
+        )
+
+        assert result["trait_count"] == 1
+        trait_inserts = client.inserts_by_type.get("personality_trait", [])
+        assert len(trait_inserts) == 1
+        assert trait_inserts[0]["state"]["content"] == "Likes dark mode"
+
+    async def test_existing_traits_included_in_prompt(self):
+        """Existing personality_trait entities are listed in the Opus prompt for deduplication."""
+        existing_trait = _make_trait("Prefers lists over prose")
+        client = TrackingClient()
+        client.set_turns([_make_turn(i) for i in range(45)])
+        client.set_traits([existing_trait])
+
+        mock_anthropic = _make_opus_mock()
+        await compact_conversation(client, mock_anthropic, TEST_SPACE_ID, TEST_USER_ID)
+
+        call_kwargs = mock_anthropic.messages.create.call_args
+        user_prompt = call_kwargs[1]["messages"][0]["content"]
+        assert "existing_traits" in user_prompt
+        assert "Prefers lists over prose" in user_prompt
 
     async def test_compacts_when_opus_wraps_json_in_code_fences(self):
         """compact_conversation succeeds even when Opus wraps the JSON in code fences."""
@@ -439,3 +538,127 @@ class TestGetConversationSummaries:
         result = await get_conversation_summaries(mock_supabase, TEST_SPACE_ID)
 
         assert result == ["Real summary"]
+
+
+# ---------------------------------------------------------------------------
+# TestCompactionResponseGuard
+# ---------------------------------------------------------------------------
+
+
+class TestCompactionResponseGuard:
+    """compact_conversation handles unexpected Anthropic response shapes gracefully."""
+
+    async def test_compaction_handles_empty_response_content(self):
+        """Returns {compacted: False, error: unexpected_response} when content is empty."""
+        client = TrackingClient()
+        client.set_turns([_make_turn(i) for i in range(45)])
+
+        mock_response = MagicMock()
+        mock_response.content = []
+        mock_anthropic = AsyncMock()
+        mock_anthropic.messages.create = AsyncMock(return_value=mock_response)
+
+        result = await compact_conversation(client, mock_anthropic, TEST_SPACE_ID, TEST_USER_ID)
+
+        assert result["compacted"] is False
+        assert result.get("error") == "unexpected_response"
+
+    async def test_compaction_handles_non_text_response_content(self):
+        """Returns {compacted: False, error: unexpected_response} when content block has no .text."""
+        client = TrackingClient()
+        client.set_turns([_make_turn(i) for i in range(45)])
+
+        # A tool_use block has no .text attribute (only .name, .id, .input)
+        tool_use_block = MagicMock(spec=["type", "name", "id", "input"])
+        tool_use_block.type = "tool_use"
+        mock_response = MagicMock()
+        mock_response.content = [tool_use_block]
+        mock_anthropic = AsyncMock()
+        mock_anthropic.messages.create = AsyncMock(return_value=mock_response)
+
+        result = await compact_conversation(client, mock_anthropic, TEST_SPACE_ID, TEST_USER_ID)
+
+        assert result["compacted"] is False
+        assert result.get("error") == "unexpected_response"
+
+
+# ---------------------------------------------------------------------------
+# TestCompactionParallelInserts
+# ---------------------------------------------------------------------------
+
+
+class TestCompactionParallelInserts:
+    """compact_conversation inserts facts, traits, and edges in parallel."""
+
+    async def test_compaction_parallel_inserts_correct_counts(self):
+        """All facts, traits, and edges from Opus are inserted and counted correctly."""
+        client = TrackingClient()
+        client.set_turns([_make_turn(i) for i in range(45)])
+
+        facts = [
+            {"content": "User likes tea", "confidence": 0.9},
+            {"content": "User works remotely", "confidence": 0.8},
+            {"content": "User has a cat", "confidence": 0.7},
+        ]
+        traits = [
+            {"content": "Prefers concise answers", "confidence": 0.85},
+            {"content": "Night owl", "confidence": 0.75},
+        ]
+        edges = [
+            {"source_id": "ent-1", "target_id": "ent-2", "relation": "related_to", "weight": 1.0},
+        ]
+        mock_anthropic = _make_opus_mock(
+            summary="A summary",
+            facts=facts,
+            personality_traits=traits,
+            edges=edges,
+        )
+
+        result = await compact_conversation(client, mock_anthropic, TEST_SPACE_ID, TEST_USER_ID)
+
+        assert result["compacted"] is True
+        assert result["fact_count"] == 3
+        assert result["trait_count"] == 2
+        assert result["edge_count"] == 1
+
+        fact_inserts = client.inserts_by_type.get("fact", [])
+        trait_inserts = client.inserts_by_type.get("personality_trait", [])
+        edge_inserts = client.inserts_by_type.get("edge", [])
+        assert len(fact_inserts) == 3
+        assert len(trait_inserts) == 2
+        assert len(edge_inserts) == 1
+
+
+# ---------------------------------------------------------------------------
+# TestTrimConversationFree
+# ---------------------------------------------------------------------------
+
+
+class TestTrimConversationFree:
+    """trim_conversation_free archives old turns for free-tier users."""
+
+    async def test_below_threshold_returns_trimmed_false(self):
+        """Returns {trimmed: False} when turn count is at or below threshold."""
+        client = TrackingClient()
+        client.set_turns([_make_turn(i) for i in range(10)])  # 10 <= 40
+
+        result = await trim_conversation_free(client, TEST_SPACE_ID)
+
+        assert result == {"trimmed": False}
+        assert len(client._updates) == 0
+
+    async def test_above_threshold_archives_old_turns(self):
+        """Archives all but the 5 most recent turns in a single batch update."""
+        client = TrackingClient()
+        client.set_turns([_make_turn(i) for i in range(45)])  # 45 > 40
+
+        result = await trim_conversation_free(client, TEST_SPACE_ID)
+
+        assert result["trimmed"] is True
+        assert result["turns_archived"] == 40
+
+        archive_updates = [
+            u for u in client._updates if u.get("data", {}).get("archived") is True
+        ]
+        assert len(archive_updates) == 1
+        assert len(archive_updates[0].get("in_ids", [])) == 40

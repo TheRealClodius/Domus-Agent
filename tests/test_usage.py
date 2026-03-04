@@ -1,10 +1,14 @@
 """Tests for agent/usage.py — tier resolution, quota checking, rate limiting, usage recording."""
 
+import asyncio
 import uuid
 from unittest.mock import MagicMock
 
 import config as cfg
-from agent.usage import Tier, check_quota, check_rate_limit, get_user_tier, record_usage
+from agent.usage import (
+    Tier, check_quota, check_rate_limit, get_user_tier, record_usage,
+    acquire_turn_slot, release_turn_slot,
+)
 
 TEST_SPACE_ID = "00000000-0000-0000-0000-000000000001"
 
@@ -246,49 +250,49 @@ class TestCheckRateLimit:
         """Each test gets a fresh user_id to avoid cross-test state contamination."""
         return str(uuid.uuid4())
 
-    def test_first_request_allowed(self):
-        allowed, retry_after = check_rate_limit(self._unique_user(), Tier.FREE)
+    async def test_first_request_allowed(self):
+        allowed, retry_after = await check_rate_limit(self._unique_user(), Tier.FREE)
 
         assert allowed is True
         assert retry_after == 0
 
-    def test_under_limit_all_allowed(self):
+    async def test_under_limit_all_allowed(self):
         """Requests up to (rpm - 1) are all allowed."""
         user_id = self._unique_user()
         rpm = cfg.RATE_LIMITS["free"]["requests_per_minute"]  # 5
 
         for i in range(rpm - 1):
-            allowed, _ = check_rate_limit(user_id, Tier.FREE)
+            allowed, _ = await check_rate_limit(user_id, Tier.FREE)
             assert allowed is True, f"Request {i + 1} should be allowed"
 
-    def test_at_limit_denied(self):
+    async def test_at_limit_denied(self):
         """The (rpm + 1)th request within 60s is denied."""
         user_id = self._unique_user()
         rpm = cfg.RATE_LIMITS["free"]["requests_per_minute"]  # 5
 
         for _ in range(rpm):
-            check_rate_limit(user_id, Tier.FREE)
+            await check_rate_limit(user_id, Tier.FREE)
 
-        allowed, retry_after = check_rate_limit(user_id, Tier.FREE)
+        allowed, retry_after = await check_rate_limit(user_id, Tier.FREE)
 
         assert allowed is False
         assert retry_after > 0
 
-    def test_over_limit_returns_positive_retry_after(self):
+    async def test_over_limit_returns_positive_retry_after(self):
         """When over limit, retry_after is a positive integer."""
         user_id = self._unique_user()
         rpm = cfg.RATE_LIMITS["citizen"]["requests_per_minute"]
 
         for _ in range(rpm):
-            check_rate_limit(user_id, Tier.CITIZEN)
+            await check_rate_limit(user_id, Tier.CITIZEN)
 
-        allowed, retry_after = check_rate_limit(user_id, Tier.CITIZEN)
+        allowed, retry_after = await check_rate_limit(user_id, Tier.CITIZEN)
 
         assert allowed is False
         assert isinstance(retry_after, int)
         assert retry_after >= 1
 
-    def test_extra_tier_allows_more_than_free(self):
+    async def test_extra_tier_allows_more_than_free(self):
         """EXTRA tier RPM is higher than FREE — extra user is allowed when free is denied."""
         free_user = self._unique_user()
         extra_user = self._unique_user()
@@ -296,28 +300,37 @@ class TestCheckRateLimit:
 
         # Exhaust free limit
         for _ in range(free_rpm):
-            check_rate_limit(free_user, Tier.FREE)
-        free_allowed, _ = check_rate_limit(free_user, Tier.FREE)
+            await check_rate_limit(free_user, Tier.FREE)
+        free_allowed, _ = await check_rate_limit(free_user, Tier.FREE)
 
         # Extra user makes the same number of requests — should still be allowed
         for _ in range(free_rpm):
-            check_rate_limit(extra_user, Tier.EXTRA)
-        extra_allowed, _ = check_rate_limit(extra_user, Tier.EXTRA)
+            await check_rate_limit(extra_user, Tier.EXTRA)
+        extra_allowed, _ = await check_rate_limit(extra_user, Tier.EXTRA)
 
         assert free_allowed is False
         assert extra_allowed is True
 
-    def test_retry_after_is_integer(self):
+    async def test_retry_after_is_integer(self):
         """retry_after is always an integer (not float)."""
         user_id = self._unique_user()
         rpm = cfg.RATE_LIMITS["free"]["requests_per_minute"]
 
         for _ in range(rpm):
-            check_rate_limit(user_id, Tier.FREE)
+            await check_rate_limit(user_id, Tier.FREE)
 
-        _, retry_after = check_rate_limit(user_id, Tier.FREE)
+        _, retry_after = await check_rate_limit(user_id, Tier.FREE)
 
         assert isinstance(retry_after, int)
+
+    async def test_check_rate_limit_is_now_async(self):
+        """check_rate_limit is async and returns a (bool, int) tuple when awaited."""
+        user_id = self._unique_user()
+        result = await check_rate_limit(user_id, Tier.FREE)
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+        assert result[0] is True
+        assert result[1] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -381,3 +394,80 @@ class TestRecordUsage:
 
         types = [r["event_type"] for r in client.inserted_rows]
         assert types == ["agent_turn", "image_generation", "web_search", "tool_call", "compaction"]
+
+
+# ---------------------------------------------------------------------------
+# TestConcurrentTurns
+# ---------------------------------------------------------------------------
+
+
+class TestConcurrentTurns:
+    """acquire_turn_slot / release_turn_slot enforce concurrent_turns limits."""
+
+    def _unique_user(self) -> str:
+        return str(uuid.uuid4())
+
+    async def test_acquire_turn_slot_allows_within_limit(self):
+        """First request is allowed for a fresh user."""
+        user_id = self._unique_user()
+        allowed = await acquire_turn_slot(user_id, Tier.FREE)
+        assert allowed is True
+        # cleanup
+        await release_turn_slot(user_id)
+
+    async def test_acquire_turn_slot_blocks_at_limit(self):
+        """Once the concurrent_turns limit is reached, further requests are denied."""
+        user_id = self._unique_user()
+        limit = cfg.RATE_LIMITS["free"]["concurrent_turns"]
+
+        for _ in range(limit):
+            await acquire_turn_slot(user_id, Tier.FREE)
+
+        allowed = await acquire_turn_slot(user_id, Tier.FREE)
+        assert allowed is False
+
+        # cleanup
+        for _ in range(limit):
+            await release_turn_slot(user_id)
+
+    async def test_release_turn_slot_frees_slot(self):
+        """After releasing a slot, a new acquire is allowed."""
+        user_id = self._unique_user()
+        limit = cfg.RATE_LIMITS["free"]["concurrent_turns"]
+
+        for _ in range(limit):
+            await acquire_turn_slot(user_id, Tier.FREE)
+
+        # Release one slot
+        await release_turn_slot(user_id)
+
+        # Should be allowed again
+        allowed = await acquire_turn_slot(user_id, Tier.FREE)
+        assert allowed is True
+
+        # cleanup
+        for _ in range(limit):
+            await release_turn_slot(user_id)
+
+    async def test_release_is_idempotent(self):
+        """release_turn_slot called more times than acquire never goes negative."""
+        user_id = self._unique_user()
+        await release_turn_slot(user_id)  # no prior acquire — should not error
+        await release_turn_slot(user_id)
+        # Slot should still be acquirable (count never went negative)
+        allowed = await acquire_turn_slot(user_id, Tier.FREE)
+        assert allowed is True
+        await release_turn_slot(user_id)
+
+    async def test_concurrent_acquire_only_one_wins(self):
+        """With limit=1, two simultaneous acquire calls yield exactly one True."""
+        user_id = self._unique_user()
+        results = await asyncio.gather(
+            acquire_turn_slot(user_id, Tier.FREE),
+            acquire_turn_slot(user_id, Tier.FREE),
+        )
+        assert sum(results) == 1  # exactly one slot granted
+        # cleanup: release however many were acquired
+        for acquired in results:
+            if acquired:
+                await release_turn_slot(user_id)

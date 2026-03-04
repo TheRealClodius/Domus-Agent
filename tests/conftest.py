@@ -92,6 +92,9 @@ class MockQueryBuilder:
     def lte(self, *args, **kwargs):
         return self
 
+    def in_(self, *args, **kwargs):
+        return self
+
     def is_(self, *args, **kwargs):
         return self
 

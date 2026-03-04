@@ -21,6 +21,7 @@ from agent.context import (
     build_system_prompt,
     _cache_get,
     _cache_set,
+    _cache_invalidate,
     _cache,
     _build_semi_static_block,
     _build_dynamic_block,
@@ -68,20 +69,65 @@ class TestEntityIndex:
 
         assert len(result) == 2
 
-    async def test_entity_index_excludes_hidden_entities(self, mock_supabase, make_entity):
-        """Hidden entities (presentation='hidden') are excluded from the index.
-
-        The mock returns whatever we set — we simulate the DB applying the
-        .neq('presentation', 'hidden') filter by only providing non-hidden rows.
-        """
-        non_hidden = [
-            make_entity(entity_type="note", presentation="window", summary="Visible"),
+    async def test_entity_index_excludes_internal_types(self, mock_supabase, make_entity):
+        """Internal memory types are always excluded regardless of presentation."""
+        entities = [
+            make_entity(entity_type="note", presentation="window", summary="Visible note"),
+            make_entity(entity_type="fact", presentation="hidden", summary="A fact"),
+            make_entity(entity_type="conversation_turn", presentation="hidden", summary="A turn"),
+            make_entity(entity_type="conversation_summary", presentation="hidden", summary="A summary"),
+            make_entity(entity_type="edge", presentation="hidden", summary="An edge"),
+            make_entity(entity_type="personality_trait", presentation="hidden", summary="A trait"),
         ]
-        mock_supabase.set_table_response("entities", non_hidden)
+        mock_supabase.set_table_response("entities", entities)
 
         result = await get_entity_index(mock_supabase, TEST_SPACE_ID)
 
-        assert all(e["presentation"] != "hidden" for e in result)
+        assert len(result) == 1
+        assert result[0]["type"] == "note"
+
+    async def test_entity_index_includes_docked_apps(self, mock_supabase, make_entity):
+        """Docked apps (presentation='hidden', type='app') ARE included — agent must see them."""
+        entities = [
+            make_entity(entity_type="app", presentation="window", summary="Calculator"),
+            make_entity(entity_type="app", presentation="hidden", summary="Habit Tracker (docked)"),
+        ]
+        mock_supabase.set_table_response("entities", entities)
+
+        result = await get_entity_index(mock_supabase, TEST_SPACE_ID)
+
+        assert len(result) == 2
+        summaries = {e["summary"] for e in result}
+        assert "Habit Tracker (docked)" in summaries
+
+    async def test_get_entity_index_excludes_invalid_hidden(self, mock_supabase, make_entity):
+        """Hidden image/folder/note entities are excluded — they have no valid docked state."""
+        entities = [
+            make_entity(entity_type="image", presentation="hidden", summary="Orphaned image"),
+            make_entity(entity_type="folder", presentation="hidden", summary="Orphaned folder"),
+            make_entity(entity_type="note", presentation="hidden", summary="Orphaned note"),
+            make_entity(entity_type="image", presentation="window", summary="Visible image"),
+        ]
+        mock_supabase.set_table_response("entities", entities)
+
+        result = await get_entity_index(mock_supabase, TEST_SPACE_ID)
+
+        assert len(result) == 1
+        assert result[0]["summary"] == "Visible image"
+
+    async def test_get_entity_index_keeps_valid_hidden(self, mock_supabase, make_entity):
+        """Hidden calendar/composed entities ARE kept — docking is valid for app-like types."""
+        entities = [
+            make_entity(entity_type="calendar", presentation="hidden", summary="Docked calendar"),
+            make_entity(entity_type="composed", presentation="hidden", summary="Docked app"),
+        ]
+        mock_supabase.set_table_response("entities", entities)
+
+        result = await get_entity_index(mock_supabase, TEST_SPACE_ID)
+
+        assert len(result) == 2
+        types = {e["type"] for e in result}
+        assert types == {"calendar", "composed"}
 
     async def test_entity_index_excludes_archived(self, mock_supabase, make_entity):
         """Archived entities should NOT appear in the index.
@@ -163,23 +209,34 @@ class TestEntityIndex:
 class TestTTLCache:
     """In-process TTL cache for entity index and user/space data."""
 
-    def test_cache_set_and_get(self):
-        _cache_set("k", {"x": 1})
-        assert _cache_get("k") == {"x": 1}
+    async def test_cache_set_and_get(self):
+        await _cache_set("k", {"x": 1})
+        assert await _cache_get("k") == {"x": 1}
 
-    def test_cache_expires(self):
-        _cache_set("k", "v", ttl=0.01)
-        time.sleep(0.02)
-        assert _cache_get("k") is None
+    async def test_cache_expires(self):
+        await _cache_set("k", "v", ttl=0.01)
+        await asyncio.sleep(0.02)
+        assert await _cache_get("k") is None
 
-    def test_cache_miss_returns_none(self):
-        assert _cache_get("nonexistent-key") is None
+    async def test_cache_miss_returns_none(self):
+        assert await _cache_get("nonexistent-key") is None
 
-    def test_cache_different_keys_are_independent(self):
-        _cache_set("key1", "val1")
-        _cache_set("key2", "val2")
-        assert _cache_get("key1") == "val1"
-        assert _cache_get("key2") == "val2"
+    async def test_cache_different_keys_are_independent(self):
+        await _cache_set("key1", "val1")
+        await _cache_set("key2", "val2")
+        assert await _cache_get("key1") == "val1"
+        assert await _cache_get("key2") == "val2"
+
+    async def test_cache_invalidate_removes_entry(self):
+        """_cache_invalidate removes a key so subsequent get returns None."""
+        await _cache_set("inv-key", "inv-val")
+        assert await _cache_get("inv-key") == "inv-val"
+        await _cache_invalidate("inv-key")
+        assert await _cache_get("inv-key") is None
+
+    async def test_cache_invalidate_nonexistent_key_is_safe(self):
+        """_cache_invalidate on a missing key should not raise."""
+        await _cache_invalidate("key-that-was-never-set")
 
 
 # ---------------------------------------------------------------------------
@@ -758,13 +815,13 @@ class TestGetConversationSummaries:
 class TestGetPersonalityTraits:
     """get_personality_traits returns traits from personality_trait entities."""
 
-    async def test_returns_trait_content_strings(self, mock_supabase):
-        """Returns list of content strings from personality_trait entities."""
+    async def test_returns_trait_dicts(self, mock_supabase):
+        """Returns list of {content, confidence} dicts from personality_trait entities."""
         entities = [
             {
                 "id": "t1",
                 "type": "personality_trait",
-                "state": {"content": "Be concise and direct"},
+                "state": {"content": "Be concise and direct", "confidence": 0.9},
             },
             {
                 "id": "t2",
@@ -776,7 +833,10 @@ class TestGetPersonalityTraits:
 
         result = await get_personality_traits(mock_supabase, TEST_SPACE_ID)
 
-        assert result == ["Be concise and direct", "Prefer bullet points over prose"]
+        assert result == [
+            {"content": "Be concise and direct", "confidence": 0.9},
+            {"content": "Prefer bullet points over prose", "confidence": 1.0},
+        ]
 
     async def test_returns_empty_when_no_traits(self, mock_supabase):
         """Returns empty list when no personality_trait entities exist."""
