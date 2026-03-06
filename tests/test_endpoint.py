@@ -13,6 +13,7 @@ _VALID_ENV = {
     "SUPABASE_SERVICE_ROLE_KEY": "test-key",
     "ANTHROPIC_API_KEY": "sk-ant-test",
     "DOMUS_SERVICE_TOKEN": "test-token",
+    "DOMUS_ADMIN_TOKEN": "test-token",
 }
 
 

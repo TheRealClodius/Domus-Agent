@@ -430,7 +430,8 @@ async def create_entity(client, space_id: str, user_id: str, params: dict) -> di
         return {"error": "frontend_unreachable", "tool": "create_entity"}
 
     if resp.status_code not in (200, 201):
-        return {"error": "create_failed", "status": resp.status_code, "body": resp.text}
+        logger.warning("create_entity_failed", extra={"status": resp.status_code, "body": resp.text[:500], "space_id": space_id})
+        return {"error": "create_failed", "status": resp.status_code}
     await _cache_invalidate(f"entity_index:{space_id}")
     return resp.json()
 
@@ -544,7 +545,8 @@ async def update_entity(client, space_id: str, user_id: str, params: dict) -> di
     if resp.status_code == 409:
         return resp.json()  # {"error": "folder_has_children", "child_ids": [...], "count": N}
     if resp.status_code != 200:
-        return {"error": "update_failed", "status": resp.status_code, "body": resp.text}
+        logger.warning("update_entity_failed", extra={"status": resp.status_code, "body": resp.text[:500], "space_id": space_id, "entity_id": entity_id})
+        return {"error": "update_failed", "status": resp.status_code}
     await _cache_invalidate(f"entity_index:{space_id}")
     return resp.json()
 
@@ -576,7 +578,8 @@ async def get_entity_schema(client, space_id: str, user_id: str, params: dict) -
         return {"error": "frontend_unreachable", "tool": "get_entity_schema"}
 
     if resp.status_code != 200:
-        return {"error": "schema_fetch_failed", "status": resp.status_code, "body": resp.text}
+        logger.warning("get_entity_schema_failed", extra={"status": resp.status_code, "body": resp.text[:500], "space_id": space_id, "entity_id": entity_id})
+        return {"error": "schema_fetch_failed", "status": resp.status_code}
     return resp.json()
 
 
@@ -605,7 +608,8 @@ async def call_entity_tool(client, space_id: str, user_id: str, params: dict) ->
         return {"error": "frontend_unreachable", "tool": "call_entity_tool"}
 
     if resp.status_code != 200:
-        return {"error": "tool_call_failed", "status": resp.status_code, "body": resp.text}
+        logger.warning("call_entity_tool_failed", extra={"status": resp.status_code, "body": resp.text[:500], "space_id": space_id, "entity_id": entity_id})
+        return {"error": "tool_call_failed", "status": resp.status_code}
     await _cache_invalidate(f"entity_index:{space_id}")
     return resp.json()
 
@@ -775,7 +779,10 @@ async def web_search(client, space_id: str, user_id: str, params: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
-_MIRRORED_TOOLS = {"create_entity", "update_entity", "build_app", "update_app"}
+_MIRRORED_TOOLS = {"create_entity", "update_entity", "build_app", "update_app", "call_entity_tool"}
+
+# Folder animation tools that require UI mirroring for gather/scatter animations
+_FOLDER_ANIMATION_TOOLS = {"add_children", "scatter", "remove_child"}
 
 
 async def execute_tool(
@@ -794,7 +801,7 @@ async def execute_tool(
     - Frontend executes the action and POSTs result back via /agent/action-result
     - On timeout, falls back to direct execution
     """
-    from agent.usage import check_quota, record_usage
+    from agent.usage import check_quota, record_usage, _get_quota_lock
     from agent.loop import _bg
 
     _tools = {
@@ -812,114 +819,135 @@ async def execute_tool(
     if fn is None:
         return {"error": "unknown_tool", "tool": name}
 
-    # Enforce quotas before executing billable tools
-    if tier is not None:
-        if name == "create_entity":
-            state = params.get("state", {}) or {}
-            if params.get("type") == "image" and ("generation_prompt" in state or "prompt" in state):
-                quota = await check_quota(client, user_id, tier, "image_generation")
+    # Per-user quota lock for image_generation — prevents TOCTOU race where two
+    # concurrent requests both pass check_quota before either records usage.
+    # asyncio.Lock is an async context manager; use nullcontext for all other tools.
+    from contextlib import nullcontext
+    _is_image_create = (
+        tier is not None
+        and name == "create_entity"
+        and params.get("type") == "image"
+        and ("generation_prompt" in (params.get("state") or {})
+             or "prompt" in (params.get("state") or {}))
+    )
+    _lock_cm = (await _get_quota_lock(user_id)) if _is_image_create else nullcontext()
+
+    async with _lock_cm:
+        # Enforce quotas before executing billable tools
+        if tier is not None:
+            if name == "create_entity":
+                state = params.get("state", {}) or {}
+                if params.get("type") == "image" and ("generation_prompt" in state or "prompt" in state):
+                    quota = await check_quota(client, user_id, tier, "image_generation")
+                    if not quota["allowed"]:
+                        return {
+                            "error": "quota_exhausted",
+                            "type": "image_generation",
+                            "message": f"Image quota exhausted. Resets at {quota['resets_at']}.",
+                        }
+            elif name == "web_search":
+                quota = await check_quota(client, user_id, tier, "web_search")
                 if not quota["allowed"]:
                     return {
                         "error": "quota_exhausted",
-                        "type": "image_generation",
-                        "message": f"Image quota exhausted. Resets at {quota['resets_at']}.",
+                        "type": "web_search",
+                        "message": f"Web search quota exhausted. Resets at {quota['resets_at']}.",
                     }
-        elif name == "web_search":
-            quota = await check_quota(client, user_id, tier, "web_search")
-            if not quota["allowed"]:
-                return {
-                    "error": "quota_exhausted",
-                    "type": "web_search",
-                    "message": f"Web search quota exhausted. Resets at {quota['resets_at']}.",
-                }
 
-    t0 = time.monotonic()
+        t0 = time.monotonic()
 
-    # UI action mirroring — intercept visible entity mutations
-    if bridge is not None and on_event is not None and name in _MIRRORED_TOOLS:
-        should_mirror = True
-        # Internal/hidden types skip mirroring — no UI representation
-        if name == "create_entity" and params.get("type", "note") in _INTERNAL_TYPES:
-            should_mirror = False
+        # UI action mirroring — intercept visible entity mutations
+        if bridge is not None and on_event is not None and name in _MIRRORED_TOOLS:
+            should_mirror = True
+            # Internal/hidden types skip mirroring — no UI representation
+            if name == "create_entity" and params.get("type", "note") in _INTERNAL_TYPES:
+                should_mirror = False
+            # Only mirror folder animation tools — other call_entity_tool uses go direct
+            elif name == "call_entity_tool" and params.get("tool_name") not in _FOLDER_ANIMATION_TOOLS:
+                should_mirror = False
 
-        if should_mirror:
-            # Pre-process server-side (e.g. image generation) before emitting to frontend
-            mirrored_params = dict(params)
-            if name == "create_entity":
-                mirrored_params = await _preprocess_create(client, space_id, user_id, params)
-            elif name == "build_app":
-                mirrored_params = _preprocess_build_app(params)
+            if should_mirror:
+                # Pre-process server-side (e.g. image generation) before emitting to frontend
+                mirrored_params = dict(params)
+                if name == "create_entity":
+                    mirrored_params = await _preprocess_create(client, space_id, user_id, params)
+                elif name == "build_app":
+                    mirrored_params = _preprocess_build_app(params)
+                elif name == "call_entity_tool":
+                    # Flatten nested params so frontend reads entity_id, tool_name, child_ids etc. directly
+                    tool_subparams = mirrored_params.pop("params", {}) or {}
+                    mirrored_params.update(tool_subparams)
 
-            action = bridge.create_action(action=name, params=mirrored_params)
-            await on_event({
-                "type": "ui_action",
-                "action_id": action.action_id,
-                "turn_id": turn_id,
-                "action": name,
-                "params": mirrored_params,
-            })
-            # Await the future directly — resolve() may have already fired
-            # during on_event (e.g. in tests) before we get here.
-            try:
-                result = await asyncio.wait_for(
-                    action.future, timeout=cfg.UI_ACTION_TIMEOUT_SECONDS,
-                )
-            except asyncio.TimeoutError:
-                bridge.cancel(action.action_id)
-                result = {"error": "ui_action_timeout", "action_id": action.action_id}
+                action = bridge.create_action(action=name, params=mirrored_params)
+                await on_event({
+                    "type": "ui_action",
+                    "action_id": action.action_id,
+                    "turn_id": turn_id,
+                    "action": name,
+                    "params": mirrored_params,
+                })
+                # Await the future directly — resolve() may have already fired
+                # during on_event (e.g. in tests) before we get here.
+                try:
+                    result = await asyncio.wait_for(
+                        action.future, timeout=cfg.UI_ACTION_TIMEOUT_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    bridge.cancel(action.action_id)
+                    result = {"error": "ui_action_timeout", "action_id": action.action_id}
 
-            # On timeout, fall back to direct execution
-            if result.get("error") == "ui_action_timeout":
-                logger.warning(
-                    "ui_action_timeout_fallback",
-                    extra={"tool": name, "action_id": action.action_id,
-                           "turn_id": turn_id, "space_id": space_id,
-                           "timeout_seconds": cfg.UI_ACTION_TIMEOUT_SECONDS},
-                )
-                # Fall through to direct execution below
-            else:
-                ms = round((time.monotonic() - t0) * 1000)
-                # Frontend responded — use its result
-                if result.get("success") is False:
+                # On timeout, fall back to direct execution
+                if result.get("error") == "ui_action_timeout":
                     logger.warning(
-                        "ui_action_failed",
+                        "ui_action_timeout_fallback",
                         extra={"tool": name, "action_id": action.action_id,
                                "turn_id": turn_id, "space_id": space_id,
-                               "error": result.get("error", "unknown")},
+                               "timeout_seconds": cfg.UI_ACTION_TIMEOUT_SECONDS},
                     )
-                    result = {
-                        "error": "ui_action_failed",
-                        "message": result.get("error", "unknown"),
-                    }
+                    # Fall through to direct execution below
                 else:
-                    result = result.get("result") or result
-                    logger.info(
-                        "ui_action_resolved",
-                        extra={"tool": name, "action_id": action.action_id,
-                               "turn_id": turn_id, "space_id": space_id,
-                               "latency_ms": ms},
+                    ms = round((time.monotonic() - t0) * 1000)
+                    # Frontend responded — use its result
+                    if result.get("success") is False:
+                        logger.warning(
+                            "ui_action_failed",
+                            extra={"tool": name, "action_id": action.action_id,
+                                   "turn_id": turn_id, "space_id": space_id,
+                                   "error": result.get("error", "unknown")},
+                        )
+                        result = {
+                            "error": "ui_action_failed",
+                            "message": result.get("error", "unknown"),
+                        }
+                    else:
+                        result = result.get("result") or result
+                        logger.info(
+                            "ui_action_resolved",
+                            extra={"tool": name, "action_id": action.action_id,
+                                   "turn_id": turn_id, "space_id": space_id,
+                                   "latency_ms": ms},
+                        )
+                    await _cache_invalidate(f"entity_index:{space_id}")
+                    _bg(
+                        record_usage(client, space_id, user_id, "tool_call", {
+                            "tool_name": name,
+                            "duration_ms": ms,
+                            "success": "error" not in result,
+                        })
                     )
-                await _cache_invalidate(f"entity_index:{space_id}")
-                _bg(
-                    record_usage(client, space_id, user_id, "tool_call", {
-                        "tool_name": name,
-                        "duration_ms": ms,
-                        "success": "error" not in result,
-                    })
-                )
-                return result
+                    return result
 
-    try:
-        result = await fn(client, space_id, user_id, params)
-    except Exception as e:
-        result = {"error": "tool_execution_failed", "tool": name, "message": str(e)}
+        try:
+            result = await fn(client, space_id, user_id, params)
+        except Exception as e:
+            result = {"error": "tool_execution_failed", "tool": name, "message": str(e)}
 
-    ms = round((time.monotonic() - t0) * 1000)
-    _bg(
-        record_usage(client, space_id, user_id, "tool_call", {
-            "tool_name": name,
-            "duration_ms": ms,
-            "success": "error" not in result,
-        })
-    )
-    return result
+        ms = round((time.monotonic() - t0) * 1000)
+        _bg(
+            record_usage(client, space_id, user_id, "tool_call", {
+                "tool_name": name,
+                "duration_ms": ms,
+                "success": "error" not in result,
+            })
+        )
+        return result

@@ -471,3 +471,51 @@ class TestConcurrentTurns:
         for acquired in results:
             if acquired:
                 await release_turn_slot(user_id)
+
+
+# ---------------------------------------------------------------------------
+# Phase 22.5 — Quota TOCTOU lock
+# ---------------------------------------------------------------------------
+
+
+class TestQuotaLock:
+    """_get_quota_lock provides per-user serialization for image_generation quota checks."""
+
+    async def test_same_user_id_returns_same_lock(self):
+        """Two calls with the same user_id return the same Lock object."""
+        from agent.usage import _get_quota_lock
+
+        user_id = str(uuid.uuid4())
+        lock1 = await _get_quota_lock(user_id)
+        lock2 = await _get_quota_lock(user_id)
+        assert lock1 is lock2
+
+    async def test_different_user_ids_return_different_locks(self):
+        """Each user_id gets its own independent lock."""
+        from agent.usage import _get_quota_lock
+
+        lock1 = await _get_quota_lock(str(uuid.uuid4()))
+        lock2 = await _get_quota_lock(str(uuid.uuid4()))
+        assert lock1 is not lock2
+
+    async def test_lock_serializes_critical_section(self):
+        """Only one coroutine can hold the lock at a time — no interleaving."""
+        from agent.usage import _get_quota_lock
+
+        user_id = str(uuid.uuid4())
+        log = []
+
+        async def _critical(label: str):
+            lock = await _get_quota_lock(user_id)
+            async with lock:
+                log.append(f"start-{label}")
+                await asyncio.sleep(0)  # yield to scheduler
+                log.append(f"end-{label}")
+
+        await asyncio.gather(_critical("A"), _critical("B"))
+
+        # Verify no interleaving: start-X must be immediately followed by end-X
+        a_start, a_end = log.index("start-A"), log.index("end-A")
+        b_start, b_end = log.index("start-B"), log.index("end-B")
+        # Either A fully completes before B starts, or B fully completes before A starts
+        assert (a_end < b_start) or (b_end < a_start)

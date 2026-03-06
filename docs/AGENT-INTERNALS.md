@@ -41,7 +41,7 @@ The system prompt is thin. Three cacheable blocks, assembled fresh each turn.
 - Conversation summaries: all `conversation_summary` entities, oldest first
 - Personality traits: all `personality_trait` entities in the space
 - `=== Recently Active ===`: top 3 entities by `updated_at` descending — gives the agent a recency signal without extra queries
-- Entity index: `[type] id: summary (presentation)` for all non-archived entities, excluding internal memory types (`conversation_turn`, `conversation_summary`, `fact`, `edge`, `personality_trait`). User-created entities are always included — even docked ones (`presentation='hidden'`).
+- Entity index: `[type] id: summary (presentation)` for all non-archived entities, excluding internal memory types (`conversation_turn`, `conversation_summary`, `fact`, `edge`, `personality_trait`). App-like types may be legitimately docked (`presentation='hidden'`) and are always included. `image`, `folder`, and `note` entities with `presentation='hidden'` are excluded as a bug-guard (those types have no valid hidden/docked state).
 
 **Block 2 — dynamic (changes every turn):**
 - Canvas context:
@@ -94,7 +94,7 @@ A module-level dict avoids redundant Supabase round-trips within and between tur
 
 | Key pattern | TTL | Data |
 |-------------|-----|------|
-| `entity_index:{space_id}` | 60 s | User-facing entity summaries (`id, type, presentation, z_index, summary, updated_at, created_at`) — internal types excluded, hidden (docked) user entities included |
+| `entity_index:{space_id}` | 60 s | User-facing entity summaries (`id, type, presentation, z_index, summary, updated_at, created_at`) — internal types excluded; `image`, `folder`, `note` entities with `presentation='hidden'` are also excluded (bug-guard: these types have no valid hidden/docked state); all other user-created types with `presentation='hidden'` are included (legitimately docked apps) |
 | `user_profile:{user_id}` | 300 s | User profile row |
 | `space_info:{space_id}` | 300 s | Space metadata row |
 
@@ -178,6 +178,26 @@ curl -X POST http://localhost:8000/debug/prompt \
 
 **Never set `DEBUG_PROMPT_ENABLED=true` in production** — this endpoint exposes the full system prompt including user data.
 
+### Admin observability endpoints (`main.py`)
+
+Requires `Authorization: Bearer <DOMUS_ADMIN_TOKEN>`. Separate from the service token — admin tooling cannot trigger agent turns.
+
+**`GET /admin/domus-context?space_id=...&user_id=...`**
+
+Returns a full snapshot of the Domus agent's assembled context and memory health for a given space/user. Bypasses the entity index cache before querying (always returns live Supabase state). Response includes:
+- `prompt_structure`: block sizes and token estimates (static, semi_static, dynamic)
+- `blocks.static`: base instructions + iframe builder context char counts
+- `blocks.semi_static`: space/user info, user facts, conversation summaries, personality traits, recently active entities, and full entity index by type
+- `blocks.dynamic`: session-created count, recent turns (role + content + timestamp)
+- `health`: `active_turn_count`, `summary_count`, `fact_count`, `edge_count`, `compaction_threshold`, `compaction_needed`, and the 10 most recent `usage_events` rows
+
+**`GET /admin/builder-context?space_id=...&user_id=...`**
+
+Returns the builder agent's prompt structure and a snapshot of all `app` entities in the space. Response includes:
+- `prompt_structure`: char/token breakdown by section (role_and_process, component_catalog, action_dsl, app_examples, design_context), tool list, and model
+- `declarative_apps`: apps with `state._def` (view-tree builder), with component/action counts and build status
+- `iframe_apps`: apps with `state._code` (React iframe builder), with build status
+
 ---
 
 ## Startup & Lifecycle (`main.py`)
@@ -197,6 +217,12 @@ async def lifespan(app):
 ```
 
 The `/agent` endpoint reads `request.app.state.supabase` and `request.app.state.anthropic` — no new clients per request. `config.py` exposes `get_shared_anthropic_client()` / `get_shared_supabase_client()` for modules that need clients outside the request path.
+
+### JWT user verification
+
+When `SUPABASE_JWT_SECRET` is configured, the `/agent` and `/agent/action-result` endpoints require an `X-User-Token` header containing the user's Supabase-issued HS256 JWT. `verify_user_jwt()` decodes it, asserts `sub` and `exp` claims are present, and verifies the `sub` matches the `user_id` in the request payload. If the JWT is invalid, expired, or mismatched, the endpoint returns 401/403.
+
+When `SUPABASE_JWT_SECRET` is absent (local dev default), the payload `user_id` is trusted as-is.
 
 ### Request lifecycle (POST /agent)
 
@@ -570,5 +596,8 @@ The agent service is not publicly accessible. Vercel's SSE proxy is the only ent
 
 1. **User auth:** Vercel validates Supabase auth cookie → extracts `user_id`
 2. **Service auth:** Vercel forwards with `Authorization: Bearer <DOMUS_SERVICE_TOKEN>`
+3. **JWT verification (optional):** When `SUPABASE_JWT_SECRET` is set, the agent also requires `X-User-Token: <supabase_jwt>`. The JWT `sub` claim must match the payload `user_id`. Returns 401/403 if absent or mismatched. When the secret is unset, `user_id` is trusted from the payload (local dev default).
 
 The agent trusts `user_id` and `space_id` from the payload because Vercel already validated the user. RLS provides defense-in-depth.
+
+**Admin auth:** `/admin/*` endpoints use a separate `DOMUS_ADMIN_TOKEN` so observability tooling has no ability to act as a user or trigger agent turns. Returns 503 if the token is not configured.

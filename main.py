@@ -5,11 +5,11 @@ import hmac
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 import config as cfg
 from agent.logging import setup_logging, get_logger
@@ -105,6 +105,28 @@ async def verify_service_auth(request: Request) -> None:
         raise HTTPException(status_code=401, detail="Invalid service token")
 
 
+def verify_user_jwt(token: str) -> str:
+    """Decode and verify a Supabase-issued HS256 JWT. Returns the `sub` claim (user_id).
+
+    Raises HTTPException(401) if the token is invalid, expired, or missing required claims.
+    Only called when SUPABASE_JWT_SECRET is configured.
+    """
+    try:
+        import jwt as pyjwt
+        payload = pyjwt.decode(
+            token,
+            cfg.SUPABASE_JWT_SECRET,
+            algorithms=["HS256"],
+            options={"require": ["sub", "exp"]},
+        )
+        sub = payload.get("sub")
+        if not sub:
+            raise HTTPException(status_code=401, detail="JWT missing sub claim")
+        return sub
+    except Exception as exc:
+        raise HTTPException(status_code=401, detail="Invalid user token") from exc
+
+
 async def verify_admin_auth(request: Request) -> None:
     """Validate the admin token for observability/debug endpoints.
 
@@ -152,6 +174,19 @@ class AgentRequest(BaseModel):
     visible_entity_ids: list[str] | None = None
     context_items: list[dict] | None = None
     user_timezone: str | None = None
+
+    @field_validator("context_items")
+    @classmethod
+    def limit_context_items(cls, v):
+        if v is None:
+            return v
+        if len(v) > 10:
+            raise ValueError("Too many context_items (max 10)")
+        for item in v:
+            data = item.get("data", "")
+            if len(data) > 10_000_000:  # ~7.5 MB base64 → ~5 MB decoded
+                raise ValueError("context_item data too large (max 5 MB)")
+        return v
 
 
 @app.post("/debug/prompt", dependencies=[Depends(verify_service_auth)])
@@ -206,8 +241,21 @@ async def debug_prompt(req: AgentRequest, request: Request):
 
 
 @app.post("/agent", dependencies=[Depends(verify_service_auth)])
-async def agent_endpoint(req: AgentRequest, request: Request):
+async def agent_endpoint(
+    req: AgentRequest,
+    request: Request,
+    x_user_token: str | None = Header(default=None),
+):
     """Accept a user message and stream SSE events from the agent loop."""
+    # When SUPABASE_JWT_SECRET is configured, verify the user's JWT forwarded by
+    # the proxy and assert the sub claim matches the payload user_id.
+    if cfg.SUPABASE_JWT_SECRET:
+        if not x_user_token:
+            raise HTTPException(status_code=401, detail="Missing X-User-Token header")
+        jwt_user_id = verify_user_jwt(x_user_token)
+        if jwt_user_id != req.user_id:
+            raise HTTPException(status_code=403, detail="user_id mismatch")
+
     # Read shared clients from app.state (set once during lifespan startup)
     supabase = request.app.state.supabase
     anthropic = request.app.state.anthropic
@@ -286,8 +334,12 @@ async def agent_endpoint(req: AgentRequest, request: Request):
                         if not terminal_event_sent:
                             exc = task.exception()
                             if exc is not None:
+                                logger.error(
+                                    "sse_task_error",
+                                    extra={"error": str(exc), "space_id": req.space_id, "user_id": req.user_id},
+                                )
                                 yield format_sse_event(
-                                    {"type": "error", "message": str(exc)}
+                                    {"type": "error", "message": "Something went wrong. Please try again."}
                                 )
                             else:
                                 yield format_sse_event({"type": "done"})
@@ -319,13 +371,23 @@ class ActionResultRequest(BaseModel):
 
 
 @app.post("/agent/action-result", dependencies=[Depends(verify_service_auth)])
-async def action_result(req: ActionResultRequest):
+async def action_result(
+    req: ActionResultRequest,
+    x_user_token: str | None = Header(default=None),
+):
     """Receive the result of a ui_action from the frontend.
 
     The frontend executes the action through its UI state machine and POSTs
     the result here. This resolves the pending Future in the ActionBridge,
     allowing the agent loop to continue.
     """
+    if cfg.SUPABASE_JWT_SECRET:
+        if not x_user_token:
+            raise HTTPException(status_code=401, detail="Missing X-User-Token header")
+        jwt_user_id = verify_user_jwt(x_user_token)
+        if jwt_user_id != req.user_id:
+            raise HTTPException(status_code=403, detail="user_id mismatch")
+
     from agent.action_bridge import get_bridge
 
     bridge = get_bridge(req.space_id, req.user_id)

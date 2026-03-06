@@ -34,7 +34,7 @@ def _build_multimodal_content(context_items: list[dict], message: str) -> list[d
     blocks = []
     for item in context_items:
         data_url = item.get("data", "")
-        name = item.get("name", "attachment")
+        name = item.get("name", "attachment")[:200].replace("\n", " ").strip()
 
         if not data_url or ";base64," not in data_url:
             continue
@@ -435,7 +435,11 @@ async def run_agent(
         await on_event({"type": "done"})
 
     except Exception as e:
-        await on_event({"type": "error", "message": str(e)})
+        logger.error(
+            "agent_turn_error",
+            extra={"space_id": space_id, "user_id": user_id, "error": str(e)},
+        )
+        await on_event({"type": "error", "message": "Something went wrong. Please try again."})
         raise
     finally:
         if bridge is not None:

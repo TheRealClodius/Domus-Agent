@@ -1969,3 +1969,212 @@ class TestExecuteToolWithBridge:
 
         messages = [r.message for r in caplog.records]
         assert "ui_action_resolved" in messages
+
+    @pytest.mark.asyncio
+    @patch("agent.loop._bg")
+    async def test_call_entity_tool_add_children_is_mirrored(self, _mock_bg):
+        """call_entity_tool add_children emits a ui_action SSE event with flattened params."""
+        from agent.action_bridge import ActionBridge
+
+        bridge = ActionBridge()
+        events = []
+
+        async def on_event(e):
+            events.append(e)
+            if e.get("type") == "ui_action":
+                bridge.resolve(e["action_id"], {
+                    "success": True,
+                    "result": {"entity_id": "folder-1", "tool_name": "add_children", "child_ids": ["c-1", "c-2"]},
+                })
+
+        result = await execute_tool(
+            None, "call_entity_tool",
+            {"entity_id": "folder-1", "tool_name": "add_children", "params": {"child_ids": ["c-1", "c-2"]}},
+            TEST_SPACE_ID, TEST_USER_ID,
+            bridge=bridge, on_event=on_event,
+        )
+
+        ui_actions = [e for e in events if e["type"] == "ui_action"]
+        assert len(ui_actions) == 1
+        assert ui_actions[0]["action"] == "call_entity_tool"
+        # Nested params must be flattened for frontend compatibility
+        assert ui_actions[0]["params"]["child_ids"] == ["c-1", "c-2"]
+        assert "params" not in ui_actions[0]["params"]
+        assert result == {"entity_id": "folder-1", "tool_name": "add_children", "child_ids": ["c-1", "c-2"]}
+
+    @pytest.mark.asyncio
+    @patch("agent.loop._bg")
+    async def test_call_entity_tool_scatter_is_mirrored(self, _mock_bg):
+        """call_entity_tool scatter emits a ui_action SSE event."""
+        from agent.action_bridge import ActionBridge
+
+        bridge = ActionBridge()
+        events = []
+
+        async def on_event(e):
+            events.append(e)
+            if e.get("type") == "ui_action":
+                bridge.resolve(e["action_id"], {
+                    "success": True,
+                    "result": {"entity_id": "folder-1", "tool_name": "scatter"},
+                })
+
+        await execute_tool(
+            None, "call_entity_tool",
+            {"entity_id": "folder-1", "tool_name": "scatter", "params": {}},
+            TEST_SPACE_ID, TEST_USER_ID,
+            bridge=bridge, on_event=on_event,
+        )
+
+        ui_actions = [e for e in events if e["type"] == "ui_action"]
+        assert len(ui_actions) == 1
+        assert ui_actions[0]["action"] == "call_entity_tool"
+        assert ui_actions[0]["params"]["tool_name"] == "scatter"
+
+    @pytest.mark.asyncio
+    @patch("agent.loop._bg")
+    async def test_call_entity_tool_non_folder_not_mirrored(self, _mock_bg):
+        """call_entity_tool with non-folder tools (send_message, etc.) goes direct, not mirrored."""
+        from agent.action_bridge import ActionBridge
+
+        bridge = ActionBridge()
+        events = []
+
+        async def on_event(e):
+            events.append(e)
+
+        with patch("config.DOMUS_FRONTEND_URL", "http://test:3000"), \
+             patch("config.DOMUS_SERVICE_TOKEN", "tok"), \
+             patch("httpx.AsyncClient") as MockClient:
+            mock_http = AsyncMock()
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.json = MagicMock(return_value={"ok": True, "result": {}})
+            mock_http.post = AsyncMock(return_value=mock_resp)
+            mock_http.__aenter__ = AsyncMock(return_value=mock_http)
+            mock_http.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = mock_http
+
+            result = await execute_tool(
+                None, "call_entity_tool",
+                {"entity_id": "chat-1", "tool_name": "send_message", "params": {"content": "hi"}},
+                TEST_SPACE_ID, TEST_USER_ID,
+                bridge=bridge, on_event=on_event,
+            )
+
+        ui_actions = [e for e in events if e.get("type") == "ui_action"]
+        assert len(ui_actions) == 0  # No mirroring for non-folder tools
+        assert result.get("ok") is True
+
+
+# ---------------------------------------------------------------------------
+# Phase 22.2 — HTTP error body sanitization
+# ---------------------------------------------------------------------------
+
+
+class TestHttpErrorBodySanitization:
+    """HTTP error returns from tools must not expose raw response body to Claude."""
+
+    @patch("httpx.AsyncClient")
+    async def test_create_entity_500_omits_body(self, MockClient):
+        """create_entity 500 error must not include body field."""
+        mock_http = AsyncMock()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 500
+        mock_resp.text = "Internal Server Error: secret DB details"
+        mock_http.post = AsyncMock(return_value=mock_resp)
+        mock_http.__aenter__ = AsyncMock(return_value=mock_http)
+        mock_http.__aexit__ = AsyncMock(return_value=False)
+        MockClient.return_value = mock_http
+
+        from agent.tools import create_entity
+
+        with patch("config.DOMUS_FRONTEND_URL", "http://test:3000"), \
+             patch("config.DOMUS_SERVICE_TOKEN", "tok"):
+            result = await create_entity(
+                None, TEST_SPACE_ID, TEST_USER_ID,
+                {"type": "note", "content": "hi"},
+            )
+
+        assert result["error"] == "create_failed"
+        assert result["status"] == 500
+        assert "body" not in result
+        assert "secret DB details" not in str(result)
+
+    @patch("httpx.AsyncClient")
+    async def test_update_entity_500_omits_body(self, MockClient, mock_supabase, make_entity):
+        """update_entity 500 error must not include body field."""
+        entity = make_entity(entity_type="note")
+        mock_supabase.set_table_response("entities", [entity])
+
+        mock_http = AsyncMock()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 500
+        mock_resp.text = "Internal Server Error: secret info"
+        mock_http.patch = AsyncMock(return_value=mock_resp)
+        mock_http.__aenter__ = AsyncMock(return_value=mock_http)
+        mock_http.__aexit__ = AsyncMock(return_value=False)
+        MockClient.return_value = mock_http
+
+        from agent.tools import update_entity
+
+        with patch("config.DOMUS_FRONTEND_URL", "http://test:3000"), \
+             patch("config.DOMUS_SERVICE_TOKEN", "tok"):
+            result = await update_entity(
+                mock_supabase, TEST_SPACE_ID, TEST_USER_ID,
+                {"id": entity["id"], "summary": "new"},
+            )
+
+        assert result["error"] == "update_failed"
+        assert result["status"] == 500
+        assert "body" not in result
+        assert "secret info" not in str(result)
+
+    @patch("httpx.AsyncClient")
+    async def test_get_entity_schema_500_omits_body(self, MockClient):
+        """get_entity_schema 500 error must not include body field."""
+        mock_http = AsyncMock()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 500
+        mock_resp.text = "Internal error: private schema details"
+        mock_http.get = AsyncMock(return_value=mock_resp)
+        mock_http.__aenter__ = AsyncMock(return_value=mock_http)
+        mock_http.__aexit__ = AsyncMock(return_value=False)
+        MockClient.return_value = mock_http
+
+        from agent.tools import get_entity_schema
+
+        with patch("config.DOMUS_FRONTEND_URL", "http://test:3000"), \
+             patch("config.DOMUS_SERVICE_TOKEN", "tok"):
+            result = await get_entity_schema(
+                None, TEST_SPACE_ID, TEST_USER_ID, {"entity_id": "ent-1"}
+            )
+
+        assert result["error"] == "schema_fetch_failed"
+        assert result["status"] == 500
+        assert "body" not in result
+
+    @patch("httpx.AsyncClient")
+    async def test_call_entity_tool_500_omits_body(self, MockClient):
+        """call_entity_tool 500 error must not include body field."""
+        mock_http = AsyncMock()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 500
+        mock_resp.text = "Internal error: private details"
+        mock_http.post = AsyncMock(return_value=mock_resp)
+        mock_http.__aenter__ = AsyncMock(return_value=mock_http)
+        mock_http.__aexit__ = AsyncMock(return_value=False)
+        MockClient.return_value = mock_http
+
+        from agent.tools import call_entity_tool
+
+        with patch("config.DOMUS_FRONTEND_URL", "http://test:3000"), \
+             patch("config.DOMUS_SERVICE_TOKEN", "tok"):
+            result = await call_entity_tool(
+                None, TEST_SPACE_ID, TEST_USER_ID,
+                {"entity_id": "ent-1", "tool_name": "add", "params": {}}
+            )
+
+        assert result["error"] == "tool_call_failed"
+        assert result["status"] == 500
+        assert "body" not in result

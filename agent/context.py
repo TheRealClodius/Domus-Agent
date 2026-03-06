@@ -415,7 +415,10 @@ def _build_dynamic_block(
             canvas_lines.append(f"Content: {content}")
         state = focused.get("state")
         if state:
-            canvas_lines.append(f"State: {json.dumps(state)}")
+            state_json = json.dumps(state)
+            if len(state_json) > 4000:
+                state_json = state_json[:4000] + "... (truncated)"
+            canvas_lines.append(f"State: {state_json}")
         # 19.8: type-aware hint for focused entity
         hint = _FOCUS_HINTS.get(focused.get("type", ""))
         if hint:

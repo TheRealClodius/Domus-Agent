@@ -1380,7 +1380,7 @@ class TestReturnExceptions:
 
         call_count = 0
 
-        async def mock_execute(client, name, params, space_id, user_id, tier=None, bridge=None, on_event=None):
+        async def mock_execute(client, name, params, space_id, user_id, tier=None, bridge=None, on_event=None, turn_id=None):
             nonlocal call_count
             call_count += 1
             if call_count == 1:
@@ -1594,3 +1594,86 @@ class TestAttentionEvents:
         clear_idx = event_types.index("agent_attention_clear")
         done_idx = event_types.index("done")
         assert clear_idx == done_idx - 1
+
+
+# ---------------------------------------------------------------------------
+# Phase 22.2 — Generic SSE error message
+# ---------------------------------------------------------------------------
+
+
+class TestGenericSseError:
+    """Agent loop emits generic error messages — not raw exception strings."""
+
+    @patch("agent.loop.build_system_prompt", new_callable=AsyncMock, return_value="test prompt")
+    async def test_error_event_is_generic(self, mock_prompt, mock_supabase, make_entity):
+        """When the Claude API call raises inside the loop, the SSE error event must be generic.
+
+        build_system_prompt is called before the try block so we simulate a failure
+        inside the loop by making anthropic_client.messages.create raise.
+        """
+        mock_supabase.set_table_response("entities", [
+            make_entity(entity_type="conversation_turn")
+        ])
+
+        mock_anthropic = MagicMock()
+        mock_anthropic.messages.create = AsyncMock(
+            side_effect=ValueError("secret DB url: postgres://user:pass@host/db")
+        )
+
+        events = []
+
+        async def capture(e):
+            events.append(e)
+
+        with pytest.raises(ValueError):
+            await run_agent(
+                mock_supabase, mock_anthropic,
+                TEST_SPACE_ID, TEST_USER_ID, "hi",
+                on_event=capture,
+            )
+
+        error_events = [e for e in events if e["type"] == "error"]
+        assert len(error_events) == 1
+        msg = error_events[0]["message"]
+        assert "secret DB url" not in msg
+        assert "postgres://" not in msg
+        assert msg == "Something went wrong. Please try again."
+
+
+# ---------------------------------------------------------------------------
+# Phase 22.4 — Name sanitization in multimodal content
+# ---------------------------------------------------------------------------
+
+
+class TestMultimodalNameSanitization:
+    """_build_multimodal_content sanitizes the attachment name field."""
+
+    def test_name_with_newlines_is_sanitized(self):
+        from agent.loop import _build_multimodal_content
+        import base64
+
+        text = "hello world"
+        b64 = base64.b64encode(text.encode()).decode()
+        items = [{"name": "evil\ninjected: header\nmore", "data": f"text/plain;base64,{b64}"}]
+        blocks = _build_multimodal_content(items, "message")
+
+        text_blocks = [b for b in blocks if b["type"] == "text" and "File:" in b["text"]]
+        assert len(text_blocks) == 1
+        assert "\n" not in text_blocks[0]["text"].split("\n")[0]  # first line (the File: header) has no newlines
+
+    def test_name_truncated_to_200_chars(self):
+        from agent.loop import _build_multimodal_content
+        import base64
+
+        text = "data"
+        b64 = base64.b64encode(text.encode()).decode()
+        long_name = "a" * 300
+        items = [{"name": long_name, "data": f"text/plain;base64,{b64}"}]
+        blocks = _build_multimodal_content(items, "message")
+
+        text_blocks = [b for b in blocks if b["type"] == "text" and "File:" in b["text"]]
+        assert len(text_blocks) == 1
+        # The name in the output should not be longer than 200 chars
+        file_header = text_blocks[0]["text"].split("\n")[0]
+        # Extract name from "[File: <name>]"
+        assert len(file_header) <= len("[File: ") + 200 + len("]")

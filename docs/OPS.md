@@ -53,6 +53,8 @@ How to run, test, and deploy the agent service. For system-wide architecture, se
 | `GOOGLE_API_KEY` | `""` | Gemini API key — image generation disabled if missing |
 | `PERPLEXITY_API_KEY` | `""` | Perplexity API key — web search returns `unavailable` if missing |
 | `DOMUS_FRONTEND_URL` | `http://localhost:3000` | Frontend base URL for schema/tool-call proxying |
+| `SUPABASE_JWT_SECRET` | `""` | Supabase JWT secret — when set, agent verifies `X-User-Token` header and asserts `sub` matches `user_id`. Absent = payload trust (safe for local dev). |
+| `DOMUS_ADMIN_TOKEN` | `""` | Token for admin/observability endpoints (`/admin/domus-context`, `/admin/builder-context`). Required to use those endpoints; separate from service token. |
 
 **Model overrides (optional):**
 
@@ -201,7 +203,7 @@ Resolved from `users.plan` at request time, cached 5 minutes in-process:
 | `image_generation` | `image_gen.py` | After Gemini upload; quota also checked before call |
 | `compaction` | `memory.py` | After Opus compaction call; includes token counts |
 
-All inserts are fire-and-forget (`asyncio.create_task`). `record_usage()` never raises.
+All inserts are fire-and-forget via `_bg()` (module-level helper in `loop.py`). `record_usage()` never raises.
 
 ### Required Supabase migration (D-2)
 

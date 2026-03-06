@@ -1014,6 +1014,48 @@ Test: `get_user_account_info` returns correct fields, omits all UUIDs, omits OAu
 
 ---
 
+## Phase 22: Security Hardening
+
+Security review identified 9 issues. Two were closed (not vulnerabilities). Two fixed prior to this phase. Five addressed here.
+
+### 22.1 — JWT Verification (Critical) 🔴 ✅
+
+**Problem:** `user_id` and `space_id` are trusted from the request payload. A leaked service token lets anyone impersonate any user.
+
+**Fix:** Vercel proxy forwards user's Supabase JWT as `X-User-Token`. When `SUPABASE_JWT_SECRET` is configured, agent decodes HS256 JWT, extracts `sub` claim, asserts it matches `req.user_id`. Falls back to payload trust when env var absent (local dev).
+
+Files: `config.py` (add `SUPABASE_JWT_SECRET`), `main.py` (`verify_user_jwt`, `/agent` + `/agent/action-result` endpoints), `requirements.txt` (add `PyJWT>=2.8.0`).
+
+### 22.2 — Sanitize Error Output (Medium) ✅
+
+**Problem:** Raw exception messages and full HTTP response bodies streamed to the browser.
+
+**Fix:** Strip `body` field from all HTTP error returns in `agent/tools.py`. Log body server-side at WARNING. Replace `str(e)` with generic user-facing message in `agent/loop.py` and `main.py` SSE generator.
+
+### 22.3 — Cap Entity State in System Prompt (Medium-High) ✅
+
+**Problem:** `json.dumps(state)` injected into system prompt with no size limit — adversarially crafted entities can bloat prompt or attempt injection.
+
+**Fix:** Truncate state JSON at 4000 chars in `_build_dynamic_block` in `agent/context.py`.
+
+### 22.4 — Bound context_items (Medium) ✅
+
+**Problem:** `AgentRequest.context_items` unlimited count and item size. `name` field injected unsanitized into Claude content blocks.
+
+**Fix:** Pydantic `field_validator` in `AgentRequest`: max 10 items, max 10 MB data per item. Sanitize `name` field in `_build_multimodal_content` in `agent/loop.py`: truncate to 200 chars, strip newlines.
+
+### 22.5 — Quota TOCTOU Race (Low-Medium) ✅
+
+**Problem:** Two concurrent image_generation requests can both pass `check_quota` before either records usage.
+
+**Fix:** Per-user `asyncio.Lock` in `agent/usage.py`. `execute_tool` uses `async with lock` for image creates — wraps check+execute atomically. In-process only (same multi-instance caveat as rate limits).
+
+### 22.6 — In-Memory Rate Limits Note (Low) ✅
+
+Added code comment in `usage.py` documenting that `_rate_windows` and `_active_turns` reset on restart and are not shared across replicas. Redis is the proper multi-instance fix.
+
+---
+
 ## Deferred (build after above phases)
 
 | What | Depends on |

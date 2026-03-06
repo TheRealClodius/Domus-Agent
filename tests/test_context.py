@@ -1291,3 +1291,55 @@ class TestSessionCreated:
             user_timezone=None,
         )
         assert "Created this session" not in result
+
+
+# ---------------------------------------------------------------------------
+# Phase 22.3 — Entity state JSON capped at 4000 chars
+# ---------------------------------------------------------------------------
+
+
+class TestStateTruncation:
+    """_build_dynamic_block truncates focused entity state JSON at 4000 chars."""
+
+    def test_state_json_under_limit_not_truncated(self):
+        """State JSON under 4000 chars is injected as-is."""
+        focused = {
+            "id": "ent-1",
+            "type": "note",
+            "summary": "A note",
+            "state": {"key": "value"},
+        }
+        result = _build_dynamic_block(
+            entities=[],
+            focused=focused,
+            turns=[],
+            viewport={"width": 1440, "height": 900},
+            visible_entity_ids=None,
+            user_timezone=None,
+        )
+        assert '"key": "value"' in result
+        assert "truncated" not in result
+
+    def test_state_json_over_4000_chars_is_truncated(self):
+        """State JSON over 4000 chars is truncated with a marker."""
+        big_state = {"data": "x" * 5000}
+        focused = {
+            "id": "ent-1",
+            "type": "note",
+            "summary": "A note",
+            "state": big_state,
+        }
+        result = _build_dynamic_block(
+            entities=[],
+            focused=focused,
+            turns=[],
+            viewport={"width": 1440, "height": 900},
+            visible_entity_ids=None,
+            user_timezone=None,
+        )
+        assert "truncated" in result
+        # The injected state section must not contain the full 5000 char value
+        state_section = [line for line in result.split("\n") if line.startswith("State:")]
+        assert len(state_section) == 1
+        # 4000 chars of JSON + len("State: ") + len("... (truncated)")
+        assert len(state_section[0]) < 4100

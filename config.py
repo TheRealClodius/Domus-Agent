@@ -25,6 +25,11 @@ DOMUS_SERVICE_TOKEN: str = os.environ["DOMUS_SERVICE_TOKEN"]
 # Optional — admin/observability token (local dev tooling only, not required in prod)
 DOMUS_ADMIN_TOKEN: str = os.environ.get("DOMUS_ADMIN_TOKEN", "")
 
+# Optional — Supabase JWT secret for verifying user tokens forwarded by the proxy.
+# When set, the agent verifies X-User-Token headers and asserts user_id matches the JWT sub.
+# Absent → payload trust (safe for local dev, no breaking change).
+SUPABASE_JWT_SECRET: str = os.environ.get("SUPABASE_JWT_SECRET", "")
+
 # Optional — deferred tools
 GOOGLE_API_KEY: str = os.environ.get("GOOGLE_API_KEY", "")
 PERPLEXITY_API_KEY: str = os.environ.get("PERPLEXITY_API_KEY", "")

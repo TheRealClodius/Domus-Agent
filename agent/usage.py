@@ -44,11 +44,27 @@ class Tier(str, Enum):
 _tier_cache: dict[str, tuple[float, "Tier"]] = {}  # user_id -> (stored_at, tier)
 _TIER_CACHE_TTL = 300.0  # 5 minutes
 
+# NOTE: _rate_windows and _active_turns are in-process only. On service restart or
+# across multiple Railway replicas, these reset to zero and are not shared.
+# Proper multi-instance fix: use Redis for atomic sliding-window counters (Phase 21+).
 _rate_windows: dict[str, list[float]] = {}  # user_id -> list of request timestamps
 _rate_windows_lock = asyncio.Lock()
 
 _active_turns: dict[str, int] = {}  # user_id -> active turn count
 _active_turns_lock = asyncio.Lock()
+
+# Per-user lock for billable quota checks — prevents TOCTOU race on image_generation.
+# In-process only (same multi-instance caveat as rate limits above).
+_quota_locks: dict[str, asyncio.Lock] = {}
+_quota_locks_dict_lock = asyncio.Lock()
+
+
+async def _get_quota_lock(user_id: str) -> asyncio.Lock:
+    """Return a per-user asyncio.Lock for serialising quota check + execute pairs."""
+    async with _quota_locks_dict_lock:
+        if user_id not in _quota_locks:
+            _quota_locks[user_id] = asyncio.Lock()
+        return _quota_locks[user_id]
 
 
 # ---------------------------------------------------------------------------
