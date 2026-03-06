@@ -1,6 +1,7 @@
 """FastAPI app — Domus Agent service entry point."""
 
 import asyncio
+import hmac
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
@@ -100,8 +101,24 @@ async def verify_service_auth(request: Request) -> None:
     if not auth or not auth.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing service token")
     token = auth.removeprefix("Bearer ")
-    if token != cfg.DOMUS_SERVICE_TOKEN:
+    if not hmac.compare_digest(token, cfg.DOMUS_SERVICE_TOKEN):
         raise HTTPException(status_code=401, detail="Invalid service token")
+
+
+async def verify_admin_auth(request: Request) -> None:
+    """Validate the admin token for observability/debug endpoints.
+
+    Separate from the service token so observability tooling cannot trigger
+    agent turns or act as any user. Requires DOMUS_ADMIN_TOKEN to be set.
+    """
+    if not cfg.DOMUS_ADMIN_TOKEN:
+        raise HTTPException(status_code=503, detail="Admin token not configured")
+    auth = request.headers.get("Authorization")
+    if not auth or not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing admin token")
+    token = auth.removeprefix("Bearer ")
+    if not hmac.compare_digest(token, cfg.DOMUS_ADMIN_TOKEN):
+        raise HTTPException(status_code=401, detail="Invalid admin token")
 
 
 # ---------------------------------------------------------------------------
@@ -336,7 +353,7 @@ async def action_result(req: ActionResultRequest):
 # ---------------------------------------------------------------------------
 
 
-@app.get("/admin/domus-context", dependencies=[Depends(verify_service_auth)])
+@app.get("/admin/domus-context", dependencies=[Depends(verify_admin_auth)])
 async def admin_domus_context(space_id: str, user_id: str, request: Request):
     """Snapshot the Domus agent's assembled context — blocks, entity index, health."""
     supabase = request.app.state.supabase
@@ -510,7 +527,7 @@ async def admin_domus_context(space_id: str, user_id: str, request: Request):
     })
 
 
-@app.get("/admin/builder-context", dependencies=[Depends(verify_service_auth)])
+@app.get("/admin/builder-context", dependencies=[Depends(verify_admin_auth)])
 async def admin_builder_context(space_id: str, user_id: str, request: Request):
     """Snapshot the Builder agent's prompt structure and recent declarative/iframe apps."""
     supabase = request.app.state.supabase

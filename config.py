@@ -22,6 +22,9 @@ SUPABASE_SERVICE_ROLE_KEY: str = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 ANTHROPIC_API_KEY: str = os.environ["ANTHROPIC_API_KEY"]
 DOMUS_SERVICE_TOKEN: str = os.environ["DOMUS_SERVICE_TOKEN"]
 
+# Optional — admin/observability token (local dev tooling only, not required in prod)
+DOMUS_ADMIN_TOKEN: str = os.environ.get("DOMUS_ADMIN_TOKEN", "")
+
 # Optional — deferred tools
 GOOGLE_API_KEY: str = os.environ.get("GOOGLE_API_KEY", "")
 PERPLEXITY_API_KEY: str = os.environ.get("PERPLEXITY_API_KEY", "")
