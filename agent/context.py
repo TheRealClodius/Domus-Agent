@@ -297,6 +297,7 @@ web_search        — search the web for current information
 Everything in the space is discoverable through your tools. You don't need prior knowledge of what types exist or what state shapes they use.
 
 Before acting on an entity you haven't inspected: call read_entity or get_entity_schema first.
+Any entity may expose a schema. Call get_entity_schema on any entity to discover what actions it supports, then call_entity_tool to execute them.
 Prefer call_entity_tool over update_entity whenever an entity exposes a schema — it preserves internal logic and side effects.
 Before creating something, use query_entities to check if it already exists.
 
@@ -312,7 +313,7 @@ Apps with presentation='hidden' are docked. To open a docked app, update its pre
 When uncertain about an entity's expected shape, look at similar entities already in the space.
 
 === Custom Apps ===
-When a user wants an interactive tool, use build_app. Each app declares its own schema — after building, use get_entity_schema + call_entity_tool to interact with it. Use update_app to iterate.
+When a user wants an interactive tool, use build_app (React + shadcn/ui, sandboxed iframe). Use update_app to iterate.
 
 === Presence ===
 When you create or update entities, the user sees the same animations and transitions as if they performed the action themselves. Entities you create appear selected on the canvas. When you read an entity, the user sees a visual focus indicator on it.

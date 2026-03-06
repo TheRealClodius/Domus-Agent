@@ -112,6 +112,10 @@ TOOL_DEFINITIONS = [
                     "type": "string",
                     "enum": ["window", "card", "folder", "hidden"],
                 },
+                "archived": {
+                    "type": "boolean",
+                    "description": "Set true to archive (soft-delete) the entity.",
+                },
             },
             "required": ["id"],
         },
@@ -481,16 +485,48 @@ async def query_entities(client, space_id: str, user_id: str, params: dict) -> d
 
 
 async def update_entity(client, space_id: str, user_id: str, params: dict) -> dict:
-    """PATCH an entity via the Next.js API. RFC 7396 merge patch is handled by the frontend."""
+    """PATCH an entity. Internal types write direct to Supabase; user-facing types go via frontend."""
     import httpx
     from config import DOMUS_FRONTEND_URL, DOMUS_SERVICE_TOKEN
 
     entity_id = params["id"]
+
+    # Resolve entity type — determines whether we write direct or via frontend
+    lookup = (
+        await client.table("entities")
+        .select("id, type")
+        .eq("id", entity_id)
+        .eq("space_id", space_id)
+        .maybe_single()
+        .execute()
+    )
+    if not lookup.data:
+        return {"error": "not_found", "id": entity_id}
+
+    entity_type = lookup.data["type"]
+
+    if entity_type in _INTERNAL_TYPES:
+        patch: dict = {}
+        for field in ("content", "state", "summary", "archived"):
+            if field in params:
+                patch[field] = params[field]
+        if not patch:
+            return lookup.data
+        result = await (
+            client.table("entities")
+            .update(patch)
+            .eq("id", entity_id)
+            .eq("space_id", space_id)
+            .execute()
+        )
+        await _cache_invalidate(f"entity_index:{space_id}")
+        return result.data[0] if result.data else {**lookup.data, **patch}
+
+    # User-facing entity — route via frontend (handles Realtime + reducers)
     body: dict = {}
     for field in ("content", "state", "summary", "position", "size", "presentation", "archived"):
         if field in params:
             body[field] = params[field]
-
     try:
         async with httpx.AsyncClient() as http:
             resp = await http.patch(

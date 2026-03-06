@@ -413,6 +413,15 @@ class TestBuildSystemPrompt:
         assert "get_entity_schema" in text
         assert "call_entity_tool" in text
 
+    async def test_schema_discovery_is_universal(self, mock_supabase):
+        """Prompt must state that any entity (not just custom apps) may expose a schema."""
+        mock_supabase.set_table_response("entities", [])
+
+        blocks = await build_system_prompt(mock_supabase, TEST_SPACE_ID, "hello")
+        text = _join_blocks(blocks)
+
+        assert "Any entity may expose a schema" in text
+
     async def test_system_prompt_has_no_hardcoded_type_schemas(self, mock_supabase):
         """Prompt must not hardcode per-type state shapes — agent discovers these at runtime."""
         mock_supabase.set_table_response("entities", [])

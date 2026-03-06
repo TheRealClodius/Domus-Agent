@@ -100,7 +100,7 @@ class TestUpdateEntity:
     def test_has_expected_properties(self):
         defn = self._get_defn()
         props = defn["input_schema"]["properties"]
-        expected_props = {"id", "content", "state", "summary", "position", "size", "presentation"}
+        expected_props = {"id", "content", "state", "summary", "position", "size", "presentation", "archived"}
         assert set(props.keys()) == expected_props
 
     def test_presentation_enum_has_folder_not_sidebar(self):
@@ -482,16 +482,140 @@ class TestQueryEntitiesFunction:
         assert "state" not in select_str
 
 
+def _make_user_facing_lookup_client(entity_id="ent-1", entity_type="note"):
+    """Mock client that returns a user-facing entity on type lookup."""
+    b = MagicMock()
+    b.select = MagicMock(return_value=b)
+    b.eq = MagicMock(return_value=b)
+    b.maybe_single = MagicMock(return_value=b)
+    res = MagicMock()
+    res.data = {"id": entity_id, "type": entity_type}
+    b.execute = AsyncMock(return_value=res)
+    client = MagicMock()
+    client.table = MagicMock(return_value=b)
+    return client
+
+
+def _make_two_call_client(lookup_entity, updated_entity):
+    """First table() call: SELECT for type lookup. Second: UPDATE result."""
+    def _builder(data):
+        b = MagicMock()
+        b.select = MagicMock(return_value=b)
+        b.update = MagicMock(return_value=b)
+        b.eq = MagicMock(return_value=b)
+        b.maybe_single = MagicMock(return_value=b)
+        res = MagicMock()
+        res.data = data
+        b.execute = AsyncMock(return_value=res)
+        return b
+
+    client = MagicMock()
+    client.table = MagicMock(side_effect=[
+        _builder(lookup_entity),       # type lookup (maybe_single → dict)
+        _builder([updated_entity]),    # update result (list)
+    ])
+    return client
+
+
+class TestUpdateEntityInternalTypes:
+    """update_entity for internal types writes directly to Supabase, bypassing frontend."""
+
+    async def test_fact_writes_to_supabase_directly(self):
+        lookup = {"id": "fact-1", "type": "fact"}
+        updated = {"id": "fact-1", "type": "fact", "content": "new content"}
+        client = _make_two_call_client(lookup, updated)
+
+        with patch("httpx.AsyncClient") as MockHttpx:
+            with patch("config.DOMUS_FRONTEND_URL", "http://test:3000"), \
+                 patch("config.DOMUS_SERVICE_TOKEN", "tok"):
+                await update_entity(client, TEST_SPACE_ID, TEST_USER_ID, {"id": "fact-1", "content": "new content"})
+
+        assert client.table.call_count == 2
+        MockHttpx.assert_not_called()
+
+    async def test_fact_archived_sets_archived_field(self):
+        lookup = {"id": "fact-1", "type": "fact"}
+        update_builder = MagicMock()
+        update_builder.select = MagicMock(return_value=update_builder)
+        update_builder.update = MagicMock(return_value=update_builder)
+        update_builder.eq = MagicMock(return_value=update_builder)
+        update_builder.maybe_single = MagicMock(return_value=update_builder)
+        update_res = MagicMock()
+        update_res.data = [{"id": "fact-1", "type": "fact", "archived": True}]
+        update_builder.execute = AsyncMock(return_value=update_res)
+
+        lookup_builder = MagicMock()
+        lookup_builder.select = MagicMock(return_value=lookup_builder)
+        lookup_builder.eq = MagicMock(return_value=lookup_builder)
+        lookup_builder.maybe_single = MagicMock(return_value=lookup_builder)
+        lookup_res = MagicMock()
+        lookup_res.data = lookup
+        lookup_builder.execute = AsyncMock(return_value=lookup_res)
+
+        client = MagicMock()
+        client.table = MagicMock(side_effect=[lookup_builder, update_builder])
+
+        with patch("httpx.AsyncClient"):
+            with patch("config.DOMUS_FRONTEND_URL", "http://test:3000"), \
+                 patch("config.DOMUS_SERVICE_TOKEN", "tok"):
+                await update_entity(client, TEST_SPACE_ID, TEST_USER_ID, {"id": "fact-1", "archived": True})
+
+        update_builder.update.assert_called_once_with({"archived": True})
+
+    async def test_personality_trait_writes_to_supabase_directly(self):
+        lookup = {"id": "trait-1", "type": "personality_trait"}
+        updated = {"id": "trait-1", "type": "personality_trait", "content": "prefers brevity"}
+        client = _make_two_call_client(lookup, updated)
+
+        with patch("httpx.AsyncClient") as MockHttpx:
+            with patch("config.DOMUS_FRONTEND_URL", "http://test:3000"), \
+                 patch("config.DOMUS_SERVICE_TOKEN", "tok"):
+                await update_entity(client, TEST_SPACE_ID, TEST_USER_ID, {"id": "trait-1", "content": "prefers brevity"})
+
+        assert client.table.call_count == 2
+        MockHttpx.assert_not_called()
+
+    async def test_internal_type_not_found_returns_error(self):
+        b = MagicMock()
+        b.select = MagicMock(return_value=b)
+        b.eq = MagicMock(return_value=b)
+        b.maybe_single = MagicMock(return_value=b)
+        res = MagicMock()
+        res.data = None
+        b.execute = AsyncMock(return_value=res)
+        client = MagicMock()
+        client.table = MagicMock(return_value=b)
+
+        result = await update_entity(client, TEST_SPACE_ID, TEST_USER_ID, {"id": "missing-1"})
+
+        assert result["error"] == "not_found"
+        assert result["id"] == "missing-1"
+
+    async def test_internal_type_update_returns_updated_row(self):
+        lookup = {"id": "fact-1", "type": "fact"}
+        updated = {"id": "fact-1", "type": "fact", "content": "corrected", "archived": False}
+        client = _make_two_call_client(lookup, updated)
+
+        with patch("httpx.AsyncClient"):
+            with patch("config.DOMUS_FRONTEND_URL", "http://test:3000"), \
+                 patch("config.DOMUS_SERVICE_TOKEN", "tok"):
+                result = await update_entity(client, TEST_SPACE_ID, TEST_USER_ID, {"id": "fact-1", "content": "corrected"})
+
+        assert result["id"] == "fact-1"
+        assert result["content"] == "corrected"
+
+
 class TestUpdateEntityFunction:
     """update_entity PATCHes Next.js /api/entities/{id}."""
 
     @patch("httpx.AsyncClient")
     async def test_patches_correct_url(self, MockClient):
         mock_http = _make_http_mock(MockClient, status_code=200, json_data={"id": "ent-1"})
+        client = _make_user_facing_lookup_client("ent-1", "note")
 
         with patch("config.DOMUS_FRONTEND_URL", "http://test:3000"), \
              patch("config.DOMUS_SERVICE_TOKEN", "tok-123"):
-            await update_entity(None, TEST_SPACE_ID, TEST_USER_ID, {"id": "ent-1", "summary": "new"})
+            await update_entity(client, TEST_SPACE_ID, TEST_USER_ID, {"id": "ent-1", "summary": "new"})
 
         mock_http.patch.assert_called_once()
         call_args = mock_http.patch.call_args
@@ -501,10 +625,11 @@ class TestUpdateEntityFunction:
     @patch("httpx.AsyncClient")
     async def test_sends_auth_header(self, MockClient):
         mock_http = _make_http_mock(MockClient, status_code=200, json_data={"id": "ent-1"})
+        client = _make_user_facing_lookup_client("ent-1", "note")
 
         with patch("config.DOMUS_FRONTEND_URL", "http://test:3000"), \
              patch("config.DOMUS_SERVICE_TOKEN", "tok-secret"):
-            await update_entity(None, TEST_SPACE_ID, TEST_USER_ID, {"id": "ent-1", "summary": "x"})
+            await update_entity(client, TEST_SPACE_ID, TEST_USER_ID, {"id": "ent-1", "summary": "x"})
 
         call_args = mock_http.patch.call_args
         assert call_args[1]["headers"]["Authorization"] == "Bearer tok-secret"
@@ -512,11 +637,12 @@ class TestUpdateEntityFunction:
     @patch("httpx.AsyncClient")
     async def test_request_body_includes_only_provided_fields(self, MockClient):
         mock_http = _make_http_mock(MockClient, status_code=200, json_data={"id": "ent-1"})
+        client = _make_user_facing_lookup_client("ent-1", "note")
 
         with patch("config.DOMUS_FRONTEND_URL", "http://test:3000"), \
              patch("config.DOMUS_SERVICE_TOKEN", "tok"):
             await update_entity(
-                None, TEST_SPACE_ID, TEST_USER_ID,
+                client, TEST_SPACE_ID, TEST_USER_ID,
                 {"id": "ent-1", "summary": "new", "state": {"x": 1}},
             )
 
@@ -528,20 +654,22 @@ class TestUpdateEntityFunction:
     async def test_returns_entity_from_response(self, MockClient):
         entity = {"id": "ent-1", "type": "note", "state": {"x": 1}}
         _make_http_mock(MockClient, status_code=200, json_data=entity)
+        client = _make_user_facing_lookup_client("ent-1", "note")
 
         with patch("config.DOMUS_FRONTEND_URL", "http://test:3000"), \
              patch("config.DOMUS_SERVICE_TOKEN", "tok"):
-            result = await update_entity(None, TEST_SPACE_ID, TEST_USER_ID, {"id": "ent-1", "summary": "new"})
+            result = await update_entity(client, TEST_SPACE_ID, TEST_USER_ID, {"id": "ent-1", "summary": "new"})
 
         assert result == entity
 
     @patch("httpx.AsyncClient")
     async def test_returns_error_on_non_200(self, MockClient):
         _make_http_mock(MockClient, status_code=500, text="Internal Server Error")
+        client = _make_user_facing_lookup_client("ent-1", "note")
 
         with patch("config.DOMUS_FRONTEND_URL", "http://test:3000"), \
              patch("config.DOMUS_SERVICE_TOKEN", "tok"):
-            result = await update_entity(None, TEST_SPACE_ID, TEST_USER_ID, {"id": "ent-1"})
+            result = await update_entity(client, TEST_SPACE_ID, TEST_USER_ID, {"id": "ent-1"})
 
         assert result["error"] == "update_failed"
         assert result["status"] == 500
@@ -550,11 +678,12 @@ class TestUpdateEntityFunction:
     async def test_returns_409_error_on_folder_has_children(self, MockClient):
         conflict = {"error": "folder_has_children", "child_ids": ["c1", "c2"], "count": 2}
         _make_http_mock(MockClient, status_code=409, json_data=conflict)
+        client = _make_user_facing_lookup_client("ent-1", "note")
 
         with patch("config.DOMUS_FRONTEND_URL", "http://test:3000"), \
              patch("config.DOMUS_SERVICE_TOKEN", "tok"):
             result = await update_entity(
-                None, TEST_SPACE_ID, TEST_USER_ID,
+                client, TEST_SPACE_ID, TEST_USER_ID,
                 {"id": "ent-1", "presentation": "hidden"},
             )
 
@@ -1502,11 +1631,12 @@ class TestEntityIndexCacheInvalidation:
     async def test_update_entity_invalidates_cache(self, MockClient):
         """update_entity on success (including archived=True / deletion) invalidates cache."""
         _make_http_mock(MockClient, status_code=200, json_data={"id": "ent-1"})
+        client = _make_user_facing_lookup_client("ent-1", "note")
 
         with patch(_INVALIDATE_PATH) as mock_inv, \
              patch("config.DOMUS_FRONTEND_URL", "http://test:3000"), \
              patch("config.DOMUS_SERVICE_TOKEN", "tok"):
-            await update_entity(None, TEST_SPACE_ID, TEST_USER_ID,
+            await update_entity(client, TEST_SPACE_ID, TEST_USER_ID,
                                 {"id": "ent-1", "archived": True})
 
         mock_inv.assert_called_once_with(self.EXPECTED_KEY)
@@ -1515,11 +1645,12 @@ class TestEntityIndexCacheInvalidation:
     async def test_update_entity_failure_does_not_invalidate(self, MockClient):
         """update_entity on non-200 response does NOT invalidate the cache."""
         _make_http_mock(MockClient, status_code=500, json_data={})
+        client = _make_user_facing_lookup_client("ent-1", "note")
 
         with patch(_INVALIDATE_PATH) as mock_inv, \
              patch("config.DOMUS_FRONTEND_URL", "http://test:3000"), \
              patch("config.DOMUS_SERVICE_TOKEN", "tok"):
-            await update_entity(None, TEST_SPACE_ID, TEST_USER_ID,
+            await update_entity(client, TEST_SPACE_ID, TEST_USER_ID,
                                 {"id": "ent-1", "summary": "new"})
 
         mock_inv.assert_not_called()
