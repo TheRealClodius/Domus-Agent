@@ -7,7 +7,7 @@ In this repo you also have a docs/AGENT-INTERNALS.MD and a docs/OPS.md with domu
  
 ## System Context
 
-Domus is three things: a Next.js frontend on Vercel, this agent service on Railway, and Supabase (Postgres, Auth, Realtime, Storage). The agent is the brain — it takes user messages, calls Claude (Sonnet for turns, Opus for compaction), and manipulates entities in Supabase via 9 tools. The frontend streams agent responses via SSE through a Vercel proxy.
+Domus is three things: a Next.js frontend on Vercel, this agent service on Railway, and Supabase (Postgres, Auth, Realtime, Storage). The agent is the brain — it takes user messages, calls Claude (Sonnet for turns, Opus for compaction), and manipulates entities in Supabase via 10 tools. The frontend streams agent responses via SSE through a Vercel proxy.
 
 
 ## Quick Reference
@@ -23,7 +23,7 @@ Domus is three things: a Next.js frontend on Vercel, this agent service on Railw
 agent/
   loop.py            — while True agent loop, Anthropic SDK direct, SSE streaming
   context.py         — Lightweight system prompt (entity index, schemas, personality, recent turns)
-  tools.py           — 9 tools + execute_tool dispatcher (see AGENT-INTERNALS.md § Tools)
+  tools.py           — 10 tools + execute_tool dispatcher (see AGENT-INTERNALS.md § Tools)
   image_gen.py       — Gemini image generation (google-genai SDK, PIL, Supabase Storage)
   logging.py         — Structured JSON logging (setup_logging, get_logger, log_tool_execution)
   memory.py          — Compaction: Opus summarizes old turns, extracts facts + edges
@@ -40,7 +40,7 @@ config.py            — Environment-based config
 ## Core Principles
 
 1. **Everything is an entity.** Notes, images, calendars, conversation turns, facts, edges — all rows in one `entities` table. `type` determines rendering, `presentation` determines framing.
-2. **9 tools, not 15.** 5 entity primitives (create, update, query, read, web_search) + 4 app helpers (get_entity_schema, call_entity_tool, build_app, update_app). If you're tempted to add a tenth, you're doing something wrong.
+2. **10 tools, not 15.** 5 entity primitives (create, update, query, read, web_search) + 5 app helpers (list_entity_types, get_entity_schema, call_entity_tool, build_app, update_app). If you're tempted to add an eleventh, you're doing something wrong.
 3. **Agentic search, not fat prompts.** System prompt is thin (entity index + personality + recent turns). Agent discovers details on demand via query_entities + read_entity.
 4. **Claude direct, no framework.** Anthropic SDK. No LangChain. The loop is ~60 lines.
 5. **Memory is entities.** conversation_turn, conversation_summary, fact, personality_trait, edge — all hidden entities. No embeddings, no vector store.

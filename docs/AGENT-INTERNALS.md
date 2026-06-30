@@ -242,7 +242,7 @@ When Anthropic returns `RateLimitError` inside the agent loop, the error is caug
 
 ## Tools (`agent/tools.py`)
 
-Nine tools are defined in `TOOL_DEFINITIONS` and dispatched through `execute_tool`. The first five are the core entity primitives; the last four are app-interaction helpers.
+Ten tools are defined in `TOOL_DEFINITIONS` and dispatched through `execute_tool`. The first five are the core entity primitives; the last five are discovery and app-interaction helpers.
 
 | Tool | What it does |
 |------|-------------|
@@ -251,12 +251,13 @@ Nine tools are defined in `TOOL_DEFINITIONS` and dispatched through `execute_too
 | `query_entities` | Search/filter entities — returns `(id, type, summary, presentation, created_at)` |
 | `read_entity` | Get one entity's full state by ID |
 | `web_search` | Search the web via Perplexity API — returns sourced answers with citations |
+| `list_entity_types` | Discover built-in types, descriptions, and initial state (hits `GET /api/entity-types`) |
 | `get_entity_schema` | Discover what structured actions an app entity supports (hits `domus-web`) |
 | `call_entity_tool` | Execute a structured action on an app entity (hits `domus-web`) |
 | `build_app` | Create a React + shadcn/ui iframe app entity (`state._code`) |
 | `update_app` | Update an existing iframe app's code, schema, or state |
 
-If you're tempted to add a tenth tool, you're probably doing something wrong.
+If you're tempted to add an eleventh tool, you're probably doing something wrong.
 
 **State merge semantics (RFC 7396):**
 - Provided scalar fields overwrite

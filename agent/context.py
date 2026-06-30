@@ -287,6 +287,7 @@ create_entity     — create a new entity in the space
 update_entity     — modify an entity (JSON Merge Patch: provided fields overwrite, null deletes, omitted fields preserved, arrays replaced entirely)
 query_entities    — search and filter entities
 read_entity       — get full details of a specific entity
+list_entity_types — discover available built-in types, descriptions, and initial state
 get_entity_schema — discover what structured actions an entity supports
 call_entity_tool  — execute a structured action on an entity
 build_app         — generate a custom interactive app (React + shadcn/ui, sandboxed iframe)
@@ -296,6 +297,7 @@ web_search        — search the web for current information
 === Discovery ===
 Everything in the space is discoverable through your tools. You don't need prior knowledge of what types exist or what state shapes they use.
 
+Before creating an entity, call list_entity_types to learn available types, descriptions, initialState, and defaultPresentation.
 Before acting on an entity you haven't inspected: call read_entity or get_entity_schema first.
 Any entity may expose a schema. Call get_entity_schema on any entity to discover what actions it supports, then call_entity_tool to execute them.
 Prefer call_entity_tool over update_entity whenever an entity exposes a schema — it preserves internal logic and side effects.

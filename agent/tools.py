@@ -1,7 +1,8 @@
 """Tool definitions and implementations for the Domus Agent.
 
-5 tools: create_entity, update_entity, query_entities, read_entity, web_search.
-Plus entity-as-MCP helpers: get_entity_schema, call_entity_tool, build_app, update_app.
+Core entity tools: create_entity, update_entity, query_entities, read_entity, web_search.
+Discovery helpers: list_entity_types, get_entity_schema, call_entity_tool.
+Builder tools: build_app, update_app.
 
 Definitions live in TOOL_DEFINITIONS (list of dicts for Claude's tools parameter).
 Implementations are async functions that take (client, space_id, user_id, params).
@@ -175,6 +176,19 @@ TOOL_DEFINITIONS = [
                 },
             },
             "required": ["id"],
+        },
+    },
+    {
+        "name": "list_entity_types",
+        "description": (
+            "List all built-in entity types the agent can create. Returns type, name, "
+            "description, defaultPresentation, defaultSize, initialState, and maxInstances "
+            "for each type. Call this when you need to know what types are available "
+            "before calling create_entity."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
         },
     },
     {
@@ -552,8 +566,32 @@ async def update_entity(client, space_id: str, user_id: str, params: dict) -> di
 
 
 # ---------------------------------------------------------------------------
-# Schema discovery and structured tool calls via frontend API
+# Type catalog and schema discovery via frontend API
 # ---------------------------------------------------------------------------
+
+
+async def list_entity_types(client, space_id: str, user_id: str, params: dict) -> dict:
+    """Fetch the built-in entity type catalog from the frontend."""
+    import httpx
+    from config import DOMUS_FRONTEND_URL
+
+    url = f"{DOMUS_FRONTEND_URL}/api/entity-types"
+
+    try:
+        async with httpx.AsyncClient() as http:
+            resp = await http.get(url, timeout=10.0)
+    except httpx.TimeoutException:
+        return {"error": "frontend_timeout", "tool": "list_entity_types"}
+    except httpx.ConnectError:
+        return {"error": "frontend_unreachable", "tool": "list_entity_types"}
+
+    if resp.status_code != 200:
+        logger.warning(
+            "list_entity_types_failed",
+            extra={"status": resp.status_code, "body": resp.text[:500]},
+        )
+        return {"error": "types_fetch_failed", "status": resp.status_code}
+    return resp.json()
 
 
 async def get_entity_schema(client, space_id: str, user_id: str, params: dict) -> dict:
@@ -809,6 +847,7 @@ async def execute_tool(
         "read_entity": read_entity,
         "query_entities": query_entities,
         "update_entity": update_entity,
+        "list_entity_types": list_entity_types,
         "get_entity_schema": get_entity_schema,
         "call_entity_tool": call_entity_tool,
         "build_app": build_app,

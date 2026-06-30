@@ -45,8 +45,8 @@ class TestToolDefinitionsStructure:
         names = [defn["name"] for defn in TOOL_DEFINITIONS]
         expected = [
             "create_entity", "update_entity", "query_entities", "read_entity",
-            "get_entity_schema", "call_entity_tool", "build_app", "update_app",
-            "web_search",
+            "list_entity_types", "get_entity_schema", "call_entity_tool",
+            "build_app", "update_app", "web_search",
         ]
         assert names == expected
 
@@ -1029,7 +1029,26 @@ class TestComputeGroupPositions:
 # ---------------------------------------------------------------------------
 
 
-from agent.tools import get_entity_schema, call_entity_tool
+from agent.tools import get_entity_schema, call_entity_tool, list_entity_types
+
+
+class TestListEntityTypesDefinition:
+    """list_entity_types tool definition."""
+
+    def _get_defn(self):
+        return next(d for d in TOOL_DEFINITIONS if d["name"] == "list_entity_types")
+
+    def test_no_required_fields(self):
+        defn = self._get_defn()
+        assert "required" not in defn["input_schema"]
+
+    def test_has_empty_properties(self):
+        defn = self._get_defn()
+        assert defn["input_schema"]["properties"] == {}
+
+    def test_has_description(self):
+        defn = self._get_defn()
+        assert "built-in" in defn["description"].lower() or "types" in defn["description"].lower()
 
 
 class TestGetEntitySchemaDefinition:
@@ -1070,6 +1089,56 @@ class TestCallEntityToolDefinition:
     def test_params_is_optional(self):
         defn = self._get_defn()
         assert "params" not in defn["input_schema"]["required"]
+
+
+class TestListEntityTypesHandler:
+    """list_entity_types handler calls frontend HTTP endpoint."""
+
+    @patch("httpx.AsyncClient")
+    async def test_calls_correct_url_without_auth(self, MockClient):
+        """Handler GETs /api/entity-types with no auth or space_id."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = [
+            {"type": "note", "name": "Note", "description": "A note"},
+            {"type": "folder", "name": "Folder", "description": "Groups entities"},
+        ]
+
+        mock_http = AsyncMock()
+        mock_http.get.return_value = mock_resp
+        mock_http.__aenter__ = AsyncMock(return_value=mock_http)
+        mock_http.__aexit__ = AsyncMock(return_value=False)
+        MockClient.return_value = mock_http
+
+        with patch("config.DOMUS_FRONTEND_URL", "http://test:3000"):
+            result = await list_entity_types(None, TEST_SPACE_ID, TEST_USER_ID, {})
+
+        mock_http.get.assert_called_once()
+        call_args = mock_http.get.call_args
+        assert call_args[0][0] == "http://test:3000/api/entity-types"
+        assert "headers" not in call_args[1] or call_args[1].get("headers") is None
+        assert "params" not in call_args[1] or call_args[1].get("params") is None
+        assert len(result) == 2
+        assert result[0]["type"] == "note"
+
+    @patch("httpx.AsyncClient")
+    async def test_returns_error_on_non_200(self, MockClient):
+        """Non-200 responses produce an error dict."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 500
+        mock_resp.text = "Internal Server Error"
+
+        mock_http = AsyncMock()
+        mock_http.get.return_value = mock_resp
+        mock_http.__aenter__ = AsyncMock(return_value=mock_http)
+        mock_http.__aexit__ = AsyncMock(return_value=False)
+        MockClient.return_value = mock_http
+
+        with patch("config.DOMUS_FRONTEND_URL", "http://test:3000"):
+            result = await list_entity_types(None, TEST_SPACE_ID, TEST_USER_ID, {})
+
+        assert result["error"] == "types_fetch_failed"
+        assert result["status"] == 500
 
 
 class TestGetEntitySchemaHandler:
@@ -1208,6 +1277,16 @@ class TestCallEntityToolHandler:
 
 class TestExecuteToolDispatchesNewTools:
     """execute_tool dispatches to new entity-as-mcp handlers."""
+
+    @patch("agent.tools.list_entity_types", new_callable=AsyncMock)
+    async def test_dispatch_list_entity_types(self, mock_fn):
+        mock_fn.return_value = [{"type": "note", "name": "Note"}]
+        result = await execute_tool(
+            None, "list_entity_types", {},
+            TEST_SPACE_ID, TEST_USER_ID,
+        )
+        mock_fn.assert_called_once_with(None, TEST_SPACE_ID, TEST_USER_ID, {})
+        assert result[0]["type"] == "note"
 
     @patch("agent.tools.get_entity_schema", new_callable=AsyncMock)
     async def test_dispatch_get_entity_schema(self, mock_fn):
@@ -1468,6 +1547,44 @@ class TestPerplexityValidation:
 
         assert result["error"] == "frontend_timeout"
         assert result["tool"] == "create_entity"
+
+
+class TestListEntityTypesHttpxErrors:
+    """list_entity_types handles httpx network errors gracefully."""
+
+    @patch("httpx.AsyncClient")
+    async def test_list_entity_types_handles_timeout(self, MockClient):
+        """list_entity_types returns a clean error dict on httpx.TimeoutException."""
+        import httpx as _httpx
+
+        mock_http = AsyncMock()
+        mock_http.get.side_effect = _httpx.TimeoutException("timed out")
+        mock_http.__aenter__ = AsyncMock(return_value=mock_http)
+        mock_http.__aexit__ = AsyncMock(return_value=False)
+        MockClient.return_value = mock_http
+
+        with patch("config.DOMUS_FRONTEND_URL", "http://test:3000"):
+            result = await list_entity_types(None, TEST_SPACE_ID, TEST_USER_ID, {})
+
+        assert result["error"] == "frontend_timeout"
+        assert result["tool"] == "list_entity_types"
+
+    @patch("httpx.AsyncClient")
+    async def test_list_entity_types_handles_connect_error(self, MockClient):
+        """list_entity_types returns a clean error dict on httpx.ConnectError."""
+        import httpx as _httpx
+
+        mock_http = AsyncMock()
+        mock_http.get.side_effect = _httpx.ConnectError("connection refused")
+        mock_http.__aenter__ = AsyncMock(return_value=mock_http)
+        mock_http.__aexit__ = AsyncMock(return_value=False)
+        MockClient.return_value = mock_http
+
+        with patch("config.DOMUS_FRONTEND_URL", "http://test:3000"):
+            result = await list_entity_types(None, TEST_SPACE_ID, TEST_USER_ID, {})
+
+        assert result["error"] == "frontend_unreachable"
+        assert result["tool"] == "list_entity_types"
 
 
 class TestGetEntitySchemaHttpxErrors:
