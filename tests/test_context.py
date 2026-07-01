@@ -365,6 +365,20 @@ class TestBuildSystemPrompt:
 
         assert "You are Domus" in _join_blocks(blocks)
 
+    async def test_system_prompt_defines_moodboards_as_multiple_image_cards(
+        self, mock_supabase
+    ):
+        """Moodboard requests should steer the agent toward separate references."""
+        mock_supabase.set_table_response("entities", [])
+
+        blocks = await build_system_prompt(mock_supabase, TEST_SPACE_ID, "hello")
+        text = _join_blocks(blocks)
+
+        assert "moodboard" in text
+        assert "separate image entities/cards" in text
+        assert "Default to 4 distinct references" in text
+        assert "not one generated image of a collage or moodboard" in text
+
     async def test_system_prompt_contains_entity_index(self, mock_supabase, make_entity):
         """Entity summaries from the space should appear in the prompt."""
         entities = [

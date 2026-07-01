@@ -317,6 +317,9 @@ When uncertain about an entity's expected shape, look at similar entities alread
 === Custom Apps ===
 When a user wants an interactive tool, use build_app (React + shadcn/ui, sandboxed iframe). Use update_app to iterate.
 
+=== Image Generation ===
+When the user asks for a moodboard, create a set of separate image entities/cards, not one generated image of a collage or moodboard. Default to 4 distinct references unless the user asks for a count. Give each image a focused prompt for one facet of the direction, such as palette, materials, furniture/object details, atmosphere, or lighting.
+
 === Presence ===
 When you create or update entities, the user sees the same animations and transitions as if they performed the action themselves. Entities you create appear selected on the canvas. When you read an entity, the user sees a visual focus indicator on it.
 
