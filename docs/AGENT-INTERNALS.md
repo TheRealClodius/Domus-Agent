@@ -16,7 +16,7 @@ A `while True` loop using the Anthropic SDK directly. No framework.
 6. After exit: fire-and-forget `record_usage(event_type='agent_turn')` with token counts; trigger compaction if >40 turns (skipped for FREE tier)
 
 **Model usage:**
-- `claude-sonnet-4-6` — interactive turns (fast, cheap, reliable tool use)
+- `claude-sonnet-5` — interactive turns (fast, cheap, reliable tool use)
 - `claude-opus-4-6` — memory compaction only (better summarization over long context)
 
 **Tier parameter:** `run_agent(..., tier=None)` accepts the resolved `Tier` enum from `main.py`. Passed through to `execute_tool()` for quota enforcement. When `tier=Tier.FREE`, compaction is skipped (no Opus budget).
@@ -375,7 +375,7 @@ The text message is always appended last. Attachments are **not** persisted in `
 
 Uses Gemini, called automatically from `create_entity` in `tools.py` when `type='image'` and `state.generation_prompt` is present. Not part of the agent loop directly.
 
-**Model:** `config.IMAGE_GEN_MODEL` (default: `gemini-2.5-flash-image`) via `response_modalities=["IMAGE"]`
+**Model:** `config.IMAGE_GEN_MODEL` (default: `gemini-3.1-flash-image`) via `response_modalities=["IMAGE"]`
 **SDK:** `google-genai` (`client.models.generate_content()`)
 **Dependencies:** `google-genai`, `Pillow` (PIL)
 

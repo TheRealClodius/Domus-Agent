@@ -62,9 +62,9 @@ Set in `.env` locally or in Railway env vars to switch models without code chang
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `AGENT_MODEL` | `claude-sonnet-4-6` | Main agent loop model |
-| `BUILDER_MODEL` | `claude-sonnet-4-6` | Declarative app builder model |
-| `IMAGE_GEN_MODEL` | `gemini-2.5-flash-image` | Gemini image generation model |
+| `AGENT_MODEL` | `claude-sonnet-5` | Main agent loop model |
+| `BUILDER_MODEL` | `claude-sonnet-5` | Declarative app builder model |
+| `IMAGE_GEN_MODEL` | `gemini-3.1-flash-image` | Gemini image generation model |
 | `COMPACTION_MODEL` | `claude-opus-4-6` | Memory compaction model |
 
 **Feature flags:**

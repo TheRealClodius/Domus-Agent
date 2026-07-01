@@ -29,7 +29,7 @@ always reflects live Supabase state (not a 60s-stale snapshot).
   "prompt_structure": {
     "total_chars": 14200,
     "token_estimate": 3550,
-    "model": "claude-sonnet-4-6",
+    "model": "claude-sonnet-5",
     "blocks": {
       "static":      { "chars": 12400, "token_estimate": 3100, "cached": true },
       "semi_static": { "chars": 1800,  "token_estimate": 450,  "cached": true },
@@ -117,7 +117,7 @@ in the space, split by kind.
       "design_context":    { "chars": 360 }
     },
     "tools": ["define_app", "finish_build"],
-    "model": "claude-sonnet-4-6"
+    "model": "claude-sonnet-5"
   },
   "declarative_apps": [
     {

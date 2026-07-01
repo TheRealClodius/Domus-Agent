@@ -226,7 +226,7 @@ The image pipeline. Fully in-memory: Supabase Storage ↔ BytesIO ↔ PIL ↔ Ge
 ### 8.1 — Generate from prompt (`agent/image_gen.py`) ✅
 
 `generate_image(prompt, space_id) → dict`. Pipeline:
-1. Call Gemini (`gemini-2.5-flash-image`) via `google-genai` SDK: `client.models.generate_content([prompt])`, with `response_modalities=["IMAGE"]`
+1. Call Gemini (`gemini-3.1-flash-image`) via `google-genai` SDK: `client.models.generate_content([prompt])`, with `response_modalities=["IMAGE"]`
 2. Extract image from response: `response.candidates[0].content.parts[0].inline_data`
 3. Load into PIL `Image.open(BytesIO(image_bytes))`
 4. Convert to PNG bytes via `BytesIO`

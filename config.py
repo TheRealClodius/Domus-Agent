@@ -37,9 +37,9 @@ PERPLEXITY_API_KEY: str = os.environ.get("PERPLEXITY_API_KEY", "")
 DOMUS_FRONTEND_URL: str = os.environ.get("DOMUS_FRONTEND_URL", "http://localhost:3000")
 
 # Model selection — override via .env to switch without code changes
-AGENT_MODEL: str = os.environ.get("AGENT_MODEL", "claude-sonnet-4-6")
-BUILDER_MODEL: str = os.environ.get("BUILDER_MODEL", "claude-sonnet-4-6")
-IMAGE_GEN_MODEL: str = os.environ.get("IMAGE_GEN_MODEL", "gemini-2.5-flash-image")
+AGENT_MODEL: str = os.environ.get("AGENT_MODEL", "claude-sonnet-5")
+BUILDER_MODEL: str = os.environ.get("BUILDER_MODEL", "claude-sonnet-5")
+IMAGE_GEN_MODEL: str = os.environ.get("IMAGE_GEN_MODEL", "gemini-3.1-flash-image")
 COMPACTION_MODEL: str = os.environ.get("COMPACTION_MODEL", "claude-opus-4-6")
 
 # Memory compaction — trigger when accumulated turns exceed heuristic
