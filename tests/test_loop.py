@@ -929,6 +929,121 @@ class TestBatchPositionInjection:
             assert "position" in params
 
 
+class TestMoodboardPlanning:
+    """Moodboard prompts should create separate image references without relying on LLM planning."""
+
+    @patch("agent.loop.build_system_prompt", new_callable=AsyncMock, return_value="test prompt")
+    @patch("agent.loop.execute_tool", new_callable=AsyncMock)
+    async def test_exact_canary_creates_four_separate_image_cards(
+        self, mock_execute, mock_prompt, mock_supabase
+    ):
+        mock_execute.side_effect = [
+            {"id": f"image-{i}", "type": "image", "presentation": "card"}
+            for i in range(4)
+        ]
+        mock_anthropic = MagicMock()
+        mock_anthropic.messages.create = AsyncMock()
+        events = []
+
+        async def collect(event):
+            events.append(event)
+
+        result = await run_agent(
+            mock_supabase,
+            mock_anthropic,
+            TEST_SPACE_ID,
+            TEST_USER_ID,
+            "Make me a moodboard image card for a cozy brutalist study with warm concrete, walnut furniture, and morning light.",
+            on_event=collect,
+            viewport={"width": 1440, "height": 900},
+        )
+
+        assert "four separate references" in result
+        assert "your cozy brutalist study" in result
+        assert "your a cozy" not in result
+        mock_prompt.assert_not_called()
+        mock_anthropic.messages.create.assert_not_called()
+        assert mock_execute.call_count == 4
+        starts = [e for e in events if e["type"] == "tool_call_start"]
+        assert len(starts) == 4
+        titles = [e["args"]["summary"] for e in starts]
+        assert titles == [
+            "Warm Concrete Study",
+            "Walnut Desk Detail",
+            "Morning Light Wall",
+            "Material Texture",
+        ]
+        for index, event in enumerate(starts):
+            args = event["args"]
+            assert args["type"] == "image"
+            assert args["presentation"] == "card"
+            state = args["state"]
+            assert state["_generated_image_batch"] == {
+                "kind": "moodboard",
+                "id": state["_generated_image_batch"]["id"],
+                "index": index,
+                "count": 4,
+                "viewport": {"width": 1440, "height": 900},
+            }
+            assert "generation_prompt" in state
+
+    @patch("agent.loop.execute_tool", new_callable=AsyncMock)
+    async def test_moodboard_user_facing_language_omits_internal_words(
+        self, mock_execute, mock_supabase
+    ):
+        mock_execute.side_effect = [
+            {"id": f"image-{i}", "type": "image", "presentation": "card"}
+            for i in range(4)
+        ]
+        mock_anthropic = MagicMock()
+        mock_anthropic.messages.create = AsyncMock()
+        events = []
+
+        async def collect(event):
+            events.append(event)
+
+        await run_agent(
+            mock_supabase,
+            mock_anthropic,
+            TEST_SPACE_ID,
+            TEST_USER_ID,
+            "Make me a moodboard image card for a cozy brutalist study with warm concrete, walnut furniture, and morning light.",
+            on_event=collect,
+            viewport={"width": 1440, "height": 900},
+        )
+
+        visible_text = " ".join(
+            [e["content"] for e in events if e["type"] == "text_delta"]
+            + [e["args"]["summary"] for e in events if e["type"] == "tool_call_start"]
+        ).lower()
+        for forbidden in ("canary", "persistence", "fixture", "test"):
+            assert forbidden not in visible_text
+
+    @patch("agent.loop.execute_tool", new_callable=AsyncMock)
+    async def test_moodboard_honors_explicit_image_count(self, mock_execute, mock_supabase):
+        mock_execute.side_effect = [
+            {"id": f"image-{i}", "type": "image", "presentation": "card"}
+            for i in range(6)
+        ]
+        mock_anthropic = MagicMock()
+        mock_anthropic.messages.create = AsyncMock()
+
+        await run_agent(
+            mock_supabase,
+            mock_anthropic,
+            TEST_SPACE_ID,
+            TEST_USER_ID,
+            "I need 6 images for a moodboard. Think warm concrete and golden hour lighting.",
+            viewport={"width": 1440, "height": 900},
+        )
+
+        assert mock_execute.call_count == 6
+        for index, call in enumerate(mock_execute.call_args_list):
+            params = call[0][2]
+            assert params["state"]["_generated_image_batch"]["index"] == index
+            assert params["state"]["_generated_image_batch"]["count"] == 6
+
+
 class TestTimezoneThreading:
     """run_agent should pass user_timezone through to build_system_prompt."""
 

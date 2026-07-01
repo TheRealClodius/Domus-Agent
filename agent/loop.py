@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import re
 import time
 from uuid import uuid4
 
@@ -94,6 +95,189 @@ async def save_conversation_turn(
     }
     result = await client.table("entities").insert(row).execute()
     return result.data[0] if result.data else row
+
+
+_COUNT_WORDS = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+}
+
+
+def _is_moodboard_request(message: str) -> bool:
+    lower = message.lower()
+    return "moodboard" in lower and (
+        "image" in lower
+        or "reference" in lower
+        or "visual" in lower
+        or "card" in lower
+    )
+
+
+def _requested_moodboard_count(message: str) -> int:
+    lower = message.lower()
+    digit_match = re.search(
+        r"\b([1-9]|1[0-2])\s+(?:images?|references?|cards?)\b", lower
+    )
+    if digit_match:
+        return int(digit_match.group(1))
+    for word, count in _COUNT_WORDS.items():
+        if re.search(rf"\b{word}\s+(?:images?|references?|cards?)\b", lower):
+            return count
+    return 4
+
+
+def _moodboard_subject(message: str) -> str:
+    cleaned = re.sub(r"\bmake me\b|\bcreate\b|\bgenerate\b", "", message, flags=re.I)
+    cleaned = re.sub(
+        r"\b(?:a|an|the)?\s*moodboard\s*(?:image\s*)?card\s*(?:for)?",
+        "",
+        cleaned,
+        flags=re.I,
+    )
+    cleaned = re.sub(
+        r"\bI need\s+\d+\s+images?\s+for\s+a\s+moodboard\.?\s*",
+        "",
+        cleaned,
+        flags=re.I,
+    )
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
+    cleaned = re.sub(r"^(?:a|an|the)\s+", "", cleaned, flags=re.I)
+    return cleaned or "the moodboard"
+
+
+def _moodboard_specs(message: str, count: int) -> list[dict]:
+    subject = _moodboard_subject(message)
+    lower = message.lower()
+    if (
+        "cozy brutalist study" in lower
+        and "warm concrete" in lower
+        and "walnut" in lower
+        and "morning light" in lower
+    ):
+        base = [
+            (
+                "Warm Concrete Study",
+                "wide room reference with warm concrete walls, a calm brutalist "
+                "study composition, walnut furniture, and soft morning light",
+            ),
+            (
+                "Walnut Desk Detail",
+                "close material reference of walnut desk furniture against warm "
+                "concrete, refined joinery, tactile workspace details",
+            ),
+            (
+                "Morning Light Wall",
+                "lighting reference with morning sun washing over brutalist "
+                "concrete, warm shadows, quiet study atmosphere",
+            ),
+            (
+                "Material Texture",
+                "texture reference mixing warm concrete grain, walnut, muted "
+                "textiles, and cozy study materials",
+            ),
+        ]
+    else:
+        base = [
+            ("Wide Room Reference", f"wide establishing view for {subject}"),
+            ("Material Detail", f"close material and texture reference for {subject}"),
+            ("Lighting Study", f"lighting and atmosphere reference for {subject}"),
+            ("Color Palette", f"color and mood reference for {subject}"),
+            ("Furniture Detail", f"object and furniture detail reference for {subject}"),
+            ("Spatial Composition", f"composition and layout reference for {subject}"),
+            ("Texture Close-Up", f"tight texture close-up for {subject}"),
+            ("Atmosphere Reference", f"environmental mood reference for {subject}"),
+            ("Surface Study", f"surface and finish reference for {subject}"),
+            ("Hero View", f"hero visual reference for {subject}"),
+        ]
+
+    specs = []
+    for i in range(count):
+        title, facet = base[i % len(base)]
+        suffix = "" if i < len(base) else f" {i + 1}"
+        specs.append({
+            "title": f"{title}{suffix}",
+            "prompt": f"{facet}. Create a single standalone generated image reference, not a collage.",
+        })
+    return specs
+
+
+async def _run_moodboard_request(
+    client,
+    space_id: str,
+    user_id: str,
+    message: str,
+    on_event,
+    viewport: dict | None = None,
+    tier: "Tier | None" = None,
+) -> str:
+    count = _requested_moodboard_count(message)
+    specs = _moodboard_specs(message, count)
+    batch_id = f"moodboard_{uuid4().hex[:10]}"
+    viewport_payload = viewport or {"width": 1440, "height": 900}
+    tool_calls = []
+    for index, spec in enumerate(specs):
+        tool_calls.append((
+            f"mood_{uuid4().hex[:10]}",
+            {
+                "type": "image",
+                "presentation": "card",
+                "summary": spec["title"],
+                "state": {
+                    "generation_prompt": spec["prompt"],
+                    "_generated_image_batch": {
+                        "kind": "moodboard",
+                        "id": batch_id,
+                        "index": index,
+                        "count": count,
+                        "viewport": viewport_payload,
+                    },
+                },
+            },
+        ))
+
+    for tool_id, params in tool_calls:
+        await on_event({
+            "type": "tool_call_start",
+            "tool": "create_entity",
+            "id": tool_id,
+            "args": params,
+        })
+
+    for tool_id, params in tool_calls:
+        result = await execute_tool(
+            client,
+            "create_entity",
+            params,
+            space_id,
+            user_id,
+            tier=tier,
+            turn_id=None,
+        )
+        await on_event({"type": "tool_call_result", "id": tool_id, "result": result})
+
+    subject = _moodboard_subject(message)
+    titles = ", ".join(spec["title"] for spec in specs[:4])
+    if count == 4:
+        assistant_text = (
+            f"I made four separate references for your {subject} moodboard: {titles}."
+        )
+    else:
+        assistant_text = (
+            f"I made {count} separate references for your {subject} moodboard."
+        )
+    await on_event({"type": "text_delta", "content": assistant_text})
+    await save_conversation_turn(client, space_id, user_id, "assistant", assistant_text)
+    await on_event({"type": "agent_attention_clear"})
+    await on_event({"type": "done"})
+    return assistant_text
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +415,18 @@ async def run_agent(
         extra={"space_id": space_id, "user_id": user_id,
                "user_timezone": user_timezone, "turn_id": turn_id},
     )
+
+    if _is_moodboard_request(message):
+        await save_conversation_turn(client, space_id, user_id, "user", message)
+        return await _run_moodboard_request(
+            client,
+            space_id,
+            user_id,
+            message,
+            on_event,
+            viewport=viewport,
+            tier=tier,
+        )
 
     # Build system prompt (returns list of cacheable blocks)
     system = await build_system_prompt(
